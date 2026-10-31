@@ -1,0 +1,675 @@
+
+import asyncio
+import os
+import re
+import logging
+from pathlib import Path
+
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+DISCORD_CHANNEL_ID = int(
+    os.getenv("DISCORD_CHANNEL_ID", "1560149229907869791")
+)
+
+RAIN_ROLE_ID = int(os.getenv("RAIN_ROLE_ID", "0"))
+BIG_RAIN_ROLE_ID = int(os.getenv("BIG_RAIN_ROLE_ID", "0"))
+
+WEBSITE_URL = "https://donutluck.com/"
+PROFILE_DIR = Path(__file__).resolve().parent / "donutluck_profile"
+
+POLL_INTERVAL = 0.25
+DISCORD_UPDATE_INTERVAL = 1.0
+
+# Waiting timer XPath
+TIMER_XPATH = (
+    "/html/body/div[1]/div[1]/div[2]/aside[1]/div[2]/"
+    "div[2]/div[1]/div[2]/div[2]/div[1]/span[1]/span[1]"
+)
+
+# Timer shown during active rain
+ACTIVE_TIMER_XPATH = (
+    "/html/body/div/div/div[2]/aside/div[2]/div[2]/"
+    "div/div[2]/span[2]/span"
+)
+
+RAIN_STATUS_XPATH = (
+    "/html/body/div/div/div[2]/aside/div[2]/div[2]/div/p[1]"
+)
+
+PARTICIPANTS_XPATH = (
+    "/html/body/div/div/div[2]/aside/div[2]/div[2]/"
+    "div/div[2]/span[1]"
+)
+
+POOL_XPATH = (
+    "/html/body/div/div/div[2]/aside/div[2]/div[2]/"
+    "div/div[2]/div[1]/div/span[1]"
+)
+
+RAIN_START_TEXT = "It's about to RAIN!"
+BIG_RAIN_THRESHOLD = 1_500_000_000
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("RainMonitor")
+
+
+# ============================================================
+# DISCORD SETUP
+# ============================================================
+
+intents = discord.Intents.default()
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+)
+
+target_channel = None
+dashboard_message = None
+
+browser_context = None
+website_page = None
+monitor_task = None
+
+latest_data = {
+    "timer": "Loading...",
+    "participants": "0",
+    "pool": "Unknown",
+    "rain_active": False,
+}
+
+
+# ============================================================
+# TIMER HELPERS
+# ============================================================
+
+def parse_timer(value):
+    if not value:
+        return None
+
+    value = value.strip()
+    match = re.search(r"(\d+):(\d{2})(?::(\d{2}))?", value)
+
+    if match:
+        first = int(match.group(1))
+        second = int(match.group(2))
+        third = match.group(3)
+
+        if third is not None:
+            return first * 3600 + second * 60 + int(third)
+
+        return first * 60 + second
+
+    if value.isdigit():
+        return int(value)
+
+    return None
+
+
+def format_timer(value):
+    seconds = parse_timer(value)
+
+    if seconds is None:
+        return value or "Unknown"
+
+    seconds = max(0, seconds)
+
+    if seconds >= 3600:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        remaining = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{remaining:02d}"
+
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+# ============================================================
+# POOL HELPERS
+# ============================================================
+
+def format_pool(value):
+    if not value:
+        return "Unknown"
+
+    value = re.sub(r"\s+", "", str(value)).replace(",", "")
+
+    match = re.search(
+        r"(\d+(?:\.\d+)?)([KMB])?(\+)?",
+        value,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return value
+
+    number = float(match.group(1))
+    suffix = (match.group(2) or "").upper()
+    plus = match.group(3) or ""
+
+    if suffix == "M" and number >= 1000:
+        number /= 1000
+        suffix = "B"
+        plus = "+"
+
+    elif suffix == "B" and number >= 1:
+        plus = plus or "+"
+
+    return f"{number:g}{suffix}{plus}"
+
+
+def pool_to_number(value):
+    """Convert pool labels such as 100.71M or 1.5B to a number."""
+
+    if not value:
+        return None
+
+    value = str(value).strip().replace(",", "")
+    match = re.search(
+        r"(\d+(?:\.\d+)?)\s*([KMB])?",
+        value,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    number = float(match.group(1))
+    suffix = (match.group(2) or "").upper()
+
+    multiplier = {
+        "": 1,
+        "K": 1_000,
+        "M": 1_000_000,
+        "B": 1_000_000_000,
+    }.get(suffix, 1)
+
+    return number * multiplier
+
+
+# ============================================================
+# FAST COMBINED WEBSITE READ
+# ============================================================
+
+async def read_website_snapshot(page):
+    script = r"""
+    (selectors) => {
+        function xpathElement(path) {
+            try {
+                return document.evaluate(
+                    path,
+                    document,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null
+                ).singleNodeValue;
+            } catch (_) {
+                return null;
+            }
+        }
+
+        function cleanText(element) {
+            return element
+                ? (element.innerText || element.textContent || "").trim()
+                : "";
+        }
+
+        function readVisibleDigits(root) {
+            if (!root) return "";
+
+            let result = "";
+
+            for (const child of Array.from(root.children)) {
+                const strip = child.querySelector(".absolute");
+
+                if (strip) {
+                    try {
+                        const transform = getComputedStyle(strip).transform;
+                        let translateY = 0;
+
+                        if (transform && transform !== "none") {
+                            translateY = new DOMMatrixReadOnly(transform).m42;
+                        }
+
+                        const firstRow = strip.firstElementChild;
+                        const rowHeight = firstRow
+                            ? firstRow.getBoundingClientRect().height
+                            : 0;
+
+                        if (rowHeight > 0) {
+                            let row = Math.round(
+                                Math.abs(translateY) / rowHeight
+                            );
+
+                            row = ((row % 10) + 10) % 10;
+
+                            const digit = (9 - row + 10) % 10;
+                            result += String(digit);
+                            continue;
+                        }
+                    } catch (_) {}
+                }
+
+                const childText = (
+                    child.innerText || child.textContent || ""
+                ).trim();
+
+                if ([".", "M", "B", "K", "+"].includes(childText)) {
+                    result += childText;
+                }
+            }
+
+            return result;
+        }
+
+        const statusElement = xpathElement(selectors.status);
+        const status = cleanText(statusElement);
+
+        const rainActive = status.toLowerCase().includes(
+            "it's about to rain!"
+        );
+
+        const timerElement = xpathElement(
+            rainActive ? selectors.activeTimer : selectors.timer
+        );
+
+        const participantsElement = xpathElement(selectors.participants);
+        const poolElement = xpathElement(selectors.pool);
+
+        let pool = "";
+
+        if (poolElement) {
+            pool = readVisibleDigits(poolElement);
+
+            if (!pool) {
+                pool = cleanText(poolElement);
+            }
+        }
+
+        return {
+            timer: cleanText(timerElement),
+            status: status,
+            participants: cleanText(participantsElement),
+            pool: pool
+        };
+    }
+    """
+
+    return await page.evaluate(
+        script,
+        {
+            "timer": TIMER_XPATH,
+            "activeTimer": ACTIVE_TIMER_XPATH,
+            "status": RAIN_STATUS_XPATH,
+            "participants": PARTICIPANTS_XPATH,
+            "pool": POOL_XPATH,
+        },
+    )
+
+
+async def website_poll_loop(page):
+    while not bot.is_closed():
+        try:
+            snapshot = await read_website_snapshot(page)
+
+            # Select the active timer only when the rain status is present.
+            status = snapshot.get("status", "")
+            rain_active = (
+                RAIN_START_TEXT.casefold() in status.casefold()
+            )
+
+            latest_data["rain_active"] = rain_active
+
+            if snapshot.get("timer"):
+                latest_data["timer"] = format_timer(snapshot["timer"])
+
+            if snapshot.get("participants"):
+                match = re.search(
+                    r"\d[\d,]*",
+                    snapshot["participants"],
+                )
+
+                if match:
+                    latest_data["participants"] = (
+                        match.group(0).replace(",", "")
+                    )
+
+            if snapshot.get("pool"):
+                latest_data["pool"] = format_pool(snapshot["pool"])
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+            logger.exception("Website polling failed")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+# ============================================================
+# EMBEDS
+# ============================================================
+
+def create_waiting_embed():
+    embed = discord.Embed(
+        title="🌧️ DonutLuck Rain Monitor",
+        description="```ansi\n\u001b[1;33m⏳ WAITING FOR RAIN\u001b[0m\n```",
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="⏱️ Rain Timer",
+        value=f"```{latest_data['timer']}```",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🌧️ Rain Pool",
+        value=f"```{latest_data['pool']}```",
+        inline=True,
+    )
+
+    embed.set_footer(text="Live status • Updates automatically")
+    return embed
+
+
+def create_active_embed():
+    embed = discord.Embed(
+        title="🌧️ DonutLuck Rain Monitor",
+        description="```ansi\n\u001b[1;31m🔴 RAIN IS ACTIVE!\u001b[0m\n```",
+        color=discord.Color.red(),
+    )
+
+    embed.add_field(
+        name="⏱️ Rain Timer",
+        value=f"```{latest_data['timer']}```",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="👥 Participants",
+        value=f"```{latest_data['participants']}```",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🌧️ Rain Pool",
+        value=f"```{latest_data['pool']}```",
+        inline=False,
+    )
+
+    embed.set_footer(text="Live status • Updates automatically")
+    return embed
+
+
+# ============================================================
+# CHANNEL CLEANUP
+# ============================================================
+
+async def clear_previous_messages(channel):
+    logger.info("Clearing messages in #%s...", channel.name)
+
+    deleted = await channel.purge(
+        limit=None,
+        bulk=True,
+        reason="DonutLuck rain monitor refresh",
+    )
+
+    logger.info("Deleted %s messages", len(deleted))
+
+
+# ============================================================
+# ROLE-BASED ALERTS
+# ============================================================
+
+async def send_active_message(channel):
+    global dashboard_message
+
+    pool_value = pool_to_number(latest_data["pool"])
+
+    if pool_value is None:
+        # If the pool cannot be read, avoid pinging the wrong role.
+        mention = "⚠️ **Rain is active, but the pool is unavailable.**"
+        allowed_mentions = discord.AllowedMentions.none()
+
+        logger.warning(
+            "Pool value unavailable; no role was pinged."
+        )
+
+    elif pool_value >= BIG_RAIN_THRESHOLD:
+        if BIG_RAIN_ROLE_ID:
+            mention = f"<@&{BIG_RAIN_ROLE_ID}>"
+            allowed_mentions = discord.AllowedMentions(
+                roles=[discord.Object(id=BIG_RAIN_ROLE_ID)]
+            )
+        else:
+            mention = "**Big Rain**"
+            allowed_mentions = discord.AllowedMentions.none()
+            logger.warning("BIG_RAIN_ROLE_ID is not configured.")
+
+    else:
+        if RAIN_ROLE_ID:
+            mention = f"<@&{RAIN_ROLE_ID}>"
+            allowed_mentions = discord.AllowedMentions(
+                roles=[discord.Object(id=RAIN_ROLE_ID)]
+            )
+        else:
+            mention = "**Rain**"
+            allowed_mentions = discord.AllowedMentions.none()
+            logger.warning("RAIN_ROLE_ID is not configured.")
+
+    dashboard_message = await channel.send(
+        content=f"{mention} 🌧️ **RAIN IS STARTING NOW!**",
+        embed=create_active_embed(),
+        allowed_mentions=allowed_mentions,
+    )
+
+
+async def send_waiting_message(channel):
+    global dashboard_message
+
+    dashboard_message = await channel.send(
+        embed=create_waiting_embed()
+    )
+
+
+# ============================================================
+# DISCORD UPDATE LOOP
+# ============================================================
+
+async def update_dashboard():
+    global dashboard_message
+
+    channel = target_channel
+    was_active = False
+
+    await clear_previous_messages(channel)
+    await send_waiting_message(channel)
+
+    while not bot.is_closed():
+        try:
+            is_active = latest_data["rain_active"]
+
+            if is_active and not was_active:
+                await clear_previous_messages(channel)
+                await send_active_message(channel)
+                was_active = True
+
+            elif not is_active and was_active:
+                await clear_previous_messages(channel)
+                await send_waiting_message(channel)
+                was_active = False
+
+            elif dashboard_message is not None:
+                embed = (
+                    create_active_embed()
+                    if was_active
+                    else create_waiting_embed()
+                )
+
+                try:
+                    await dashboard_message.edit(embed=embed)
+
+                except discord.NotFound:
+                    dashboard_message = None
+
+                except discord.HTTPException:
+                    logger.exception("Discord dashboard edit failed")
+
+                if dashboard_message is None:
+                    if was_active:
+                        # Recreate the dashboard without another role ping.
+                        dashboard_message = await channel.send(
+                            embed=create_active_embed()
+                        )
+                    else:
+                        await send_waiting_message(channel)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+            logger.exception("Discord dashboard update failed")
+
+        await asyncio.sleep(DISCORD_UPDATE_INTERVAL)
+
+
+# ============================================================
+# BROWSER
+# ============================================================
+
+async def start_browser():
+    global browser_context, website_page
+
+    playwright = await async_playwright().start()
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    browser_context = await playwright.chromium.launch_persistent_context(
+        user_data_dir=str(PROFILE_DIR),
+        headless=False,
+        args=[
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+        ],
+        viewport={"width": 1280, "height": 900},
+    )
+
+    website_page = (
+        browser_context.pages[0]
+        if browser_context.pages
+        else await browser_context.new_page()
+    )
+
+    website_page.set_default_timeout(3000)
+
+    logger.info("Opening DonutLuck...")
+
+    try:
+        await website_page.goto(
+            WEBSITE_URL,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+    except PlaywrightTimeoutError:
+        logger.warning("Page load timed out; continuing.")
+
+    await asyncio.sleep(2)
+    logger.info("Browser ready")
+
+    return playwright
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+async def start_monitoring():
+    playwright = None
+    poll_task = None
+    discord_task = None
+
+    try:
+        playwright = await start_browser()
+
+        poll_task = asyncio.create_task(
+            website_poll_loop(website_page)
+        )
+
+        discord_task = asyncio.create_task(
+            update_dashboard()
+        )
+
+        await asyncio.gather(poll_task, discord_task)
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception:
+        logger.exception("Monitor stopped unexpectedly")
+
+    finally:
+        for task in (poll_task, discord_task):
+            if task and not task.done():
+                task.cancel()
+
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception:
+                logger.exception("Could not stop Playwright cleanly")
+
+
+@bot.event
+async def on_ready():
+    global target_channel, monitor_task
+
+    logger.info("Logged in as %s", bot.user)
+
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
+        except discord.HTTPException:
+            logger.exception("Could not find the configured channel.")
+            return
+
+    target_channel = channel
+
+    if monitor_task is None or monitor_task.done():
+        monitor_task = asyncio.create_task(start_monitoring())
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+    if not DISCORD_TOKEN:
+        raise RuntimeError(
+            "DISCORD_TOKEN is missing from your .env file."
+        )
+
+    async with bot:
+        await bot.start(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Rain monitor stopped.")
