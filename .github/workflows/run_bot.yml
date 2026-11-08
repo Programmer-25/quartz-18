@@ -18,9 +18,9 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-      DISCORD_CHANNEL_ID: ${{ vars.DISCORD_CHANNEL_ID || '1560149229907869791' }}
-      RAIN_ROLE_ID: ${{ vars.RAIN_ROLE_ID || '0' }}
-      BIG_RAIN_ROLE_ID: ${{ vars.BIG_RAIN_ROLE_ID || '0' }}
+      DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+      RAIN_ROLE_ID: ${{ secrets.RAIN_ROLE_ID }}
+      BIG_RAIN_ROLE_ID: ${{ secrets.BIG_RAIN_ROLE_ID }}
       HEADLESS: "false"
 
     steps:
