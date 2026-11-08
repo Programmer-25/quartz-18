@@ -1,0 +1,37 @@
+name: Continuous 24-7 Browser Bot
+
+on:
+  schedule:
+    # This automatically triggers your bot every 3 hours, day and night
+    - cron: '0 */3 * * *'
+  workflow_dispatch: # This adds a manual "Run" button to your interface
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python Runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Linux Framebuffer Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libxss1 libnss3 libnspr4 libgbm1
+
+      - name: Install Selenium Core Packages
+        run: |
+          pip install --upgrade pip
+          pip install selenium python-dotenv
+
+      - name: Load Environment Variables and Execute Bot
+        run: |
+          # Read your existing .env file and export keys into the step memory
+          export $(grep -v '^#' .env | xargs)
+          
+          # xvfb-run opens a hidden graphic screen layer so headless=False functions perfectly
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python rain.py
