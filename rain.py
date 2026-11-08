@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 import re
@@ -8,11 +9,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from playwright.async_api import (
-    async_playwright,
-    TimeoutError as PlaywrightTimeoutError,
-    Error as PlaywrightError
-)
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 # ============================================================
@@ -34,11 +31,11 @@ BIG_RAIN_ROLE_ID = int(os.getenv("BIG_RAIN_ROLE_ID", "0"))
 
 WEBSITE_URL = "https://donutluck.com/"
 
-# Always use visible Chromium.
-# GitHub Actions must launch this script through xvfb-run.
-HEADLESS = False
+# GitHub Actions uses Xvfb, allowing visible Chromium.
+HEADLESS = os.getenv("HEADLESS", "false").lower() in (
+    "true", "1", "yes"
+)
 
-# Keep browser profile outside the repository by default.
 PROFILE_DIR = Path(
     os.getenv(
         "PLAYWRIGHT_PROFILE_DIR",
@@ -53,37 +50,32 @@ RAIN_START_TEXT = "It's about to RAIN!"
 
 BIG_RAIN_THRESHOLD = 1_500_000_000
 
-MAX_RUN_DURATION = 11100  # 3 hours and 5 minutes
+MAX_RUN_DURATION = 11100
 
 
 # ============================================================
 # WEBSITE SELECTORS
 # ============================================================
 
-# Waiting timer
 TIMER_XPATH = (
     "/html/body/div[1]/div[1]/div[2]/aside[1]/div[2]/"
     "div[2]/div[1]/div[2]/div[2]/div[1]/span[1]/span[1]"
 )
 
-# Active rain timer
 ACTIVE_TIMER_XPATH = (
     "/html/body/div/div/div[2]/aside/div[2]/div[2]/"
     "div/div[2]/span[2]/span"
 )
 
-# Rain status
 RAIN_STATUS_XPATH = (
     "/html/body/div/div/div[2]/aside/div[2]/div[2]/div/p[1]"
 )
 
-# Participants
 PARTICIPANTS_XPATH = (
     "/html/body/div/div/div[2]/aside/div[2]/div[2]/"
     "div/div[2]/span[1]"
 )
 
-# Animated rain pool
 POOL_XPATH = (
     "/html/body/div/div/div[2]/aside/div[2]/div[2]/"
     "div/div[2]/div[1]/div/span[1]"
@@ -282,9 +274,6 @@ async def read_website_snapshot(page):
                 : "";
         }
 
-        // Reads the currently visible digit from animated
-        // vertical number strips.
-
         function readVisibleDigits(root) {
 
             if (!root) return "";
@@ -357,8 +346,6 @@ async def read_website_snapshot(page):
             "it's about to rain!"
         );
 
-        // Use the correct timer for the current state.
-
         const timerElement = xpathElement(
             rainActive
                 ? selectors.activeTimer
@@ -397,61 +384,16 @@ async def read_website_snapshot(page):
     }
     """
 
-    selectors = {
-        "timer": TIMER_XPATH,
-        "activeTimer": ACTIVE_TIMER_XPATH,
-        "status": RAIN_STATUS_XPATH,
-        "participants": PARTICIPANTS_XPATH,
-        "pool": POOL_XPATH
-    }
-
-    # A navigation can destroy the JavaScript execution context
-    # while page.evaluate() is running. Retry that snapshot.
-
-    for attempt in range(3):
-
-        try:
-
-            if page.is_closed():
-                raise PlaywrightError("DonutLuck page is closed.")
-
-            return await page.evaluate(
-                script,
-                selectors
-            )
-
-        except PlaywrightError as error:
-
-            error_text = str(error).lower()
-
-            navigation_error = (
-                "execution context was destroyed" in error_text
-                or "most likely because of a navigation" in error_text
-                or "frame was detached" in error_text
-                or "navigation" in error_text
-            )
-
-            if not navigation_error:
-                raise
-
-            if attempt < 2:
-
-                logger.warning(
-                    "DonutLuck page navigated during snapshot "
-                    "(attempt %s/3). Retrying...",
-                    attempt + 1
-                )
-
-                await asyncio.sleep(0.4)
-
-            else:
-
-                logger.warning(
-                    "Could not read snapshot because the page "
-                    "is still navigating. Will retry next poll."
-                )
-
-    return None
+    return await page.evaluate(
+        script,
+        {
+            "timer": TIMER_XPATH,
+            "activeTimer": ACTIVE_TIMER_XPATH,
+            "status": RAIN_STATUS_XPATH,
+            "participants": PARTICIPANTS_XPATH,
+            "pool": POOL_XPATH
+        }
+    )
 
 
 # ============================================================
@@ -461,6 +403,7 @@ async def read_website_snapshot(page):
 async def website_poll_loop(page):
 
     start_time = time.monotonic()
+    last_debug_time = 0
 
     logger.info("Website polling started.")
 
@@ -473,27 +416,39 @@ async def website_poll_loop(page):
             )
 
             await bot.close()
-
             break
 
         try:
 
             snapshot = await read_website_snapshot(page)
 
-            # A navigation retry may return no snapshot.
-            # Keep the last valid values instead of replacing
-            # them with Loading or Unknown.
-
-            if snapshot is None:
-
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
             status = snapshot.get("status", "")
-
-            latest_data["rain_active"] = (
+            detected_active = (
                 RAIN_START_TEXT.casefold() in status.casefold()
             )
+
+            # Log website status every 5 seconds.
+            if time.monotonic() - last_debug_time >= 5:
+
+                logger.info(
+                    "RAIN DEBUG | Status: %r | Timer: %r | "
+                    "Detected active: %s | Pool: %r",
+                    status,
+                    snapshot.get("timer"),
+                    detected_active,
+                    snapshot.get("pool")
+                )
+
+                last_debug_time = time.monotonic()
+
+            if detected_active and not latest_data["rain_active"]:
+
+                logger.warning(
+                    "WEBSITE RAIN DETECTED! Status: %r",
+                    status
+                )
+
+            latest_data["rain_active"] = detected_active
 
             if snapshot.get("timer"):
 
@@ -642,6 +597,14 @@ async def send_active_message(channel):
 
     global dashboard_message
 
+    logger.info(
+        "ALERT FUNCTION CALLED | Rain Role ID: %s | "
+        "Big Rain Role ID: %s | Pool: %s",
+        RAIN_ROLE_ID,
+        BIG_RAIN_ROLE_ID,
+        latest_data["pool"]
+    )
+
     pool_value = pool_to_number(
         latest_data["pool"]
     )
@@ -660,8 +623,6 @@ async def send_active_message(channel):
         )
 
     elif pool_value >= BIG_RAIN_THRESHOLD:
-
-        # BIG RAIN: ping both roles.
 
         role_ids = [
             role_id
@@ -699,12 +660,12 @@ async def send_active_message(channel):
             allowed_mentions = discord.AllowedMentions.none()
 
         logger.info(
-            "Big Rain detected: both roles selected."
+            "BIG RAIN ALERT | Roles selected: %s | Message: %s",
+            role_ids,
+            content
         )
 
     else:
-
-        # NORMAL RAIN: ping only the Rain role.
 
         if RAIN_ROLE_ID:
 
@@ -728,20 +689,25 @@ async def send_active_message(channel):
             allowed_mentions = discord.AllowedMentions.none()
 
         logger.info(
-            "Normal Rain detected: Rain role selected."
-        )
-        logger.info(
-            "PING DEBUG | Rain Role: %s | Big Rain Role: %s | Message: %s",
+            "NORMAL RAIN ALERT | Role selected: %s | Message: %s",
             RAIN_ROLE_ID,
-            BIG_RAIN_ROLE_ID,
             content
         )
+
+    logger.info(
+        "SENDING DISCORD ALERT NOW."
+    )
+
     dashboard_message = await channel.send(
         content=content,
         embed=create_active_embed(),
         allowed_mentions=allowed_mentions
     )
-    
+
+    logger.info(
+        "DISCORD ALERT SENT | Message ID: %s",
+        dashboard_message.id
+    )
 
 
 # ============================================================
@@ -781,19 +747,18 @@ async def update_dashboard():
 
             is_active = latest_data["rain_active"]
 
-            # Rain starts.
-
             if is_active and not was_active:
 
-                logger.info("Rain state changed to ACTIVE.")
+                logger.info(
+                    "DASHBOARD DETECTED RAIN START | "
+                    "Calling send_active_message()."
+                )
 
                 await clear_previous_messages(channel)
 
                 await send_active_message(channel)
 
                 was_active = True
-
-            # Rain ends.
 
             elif not is_active and was_active:
 
@@ -804,8 +769,6 @@ async def update_dashboard():
                 await send_waiting_message(channel)
 
                 was_active = False
-
-            # Normal dashboard refresh.
 
             elif dashboard_message is not None:
 
@@ -834,8 +797,6 @@ async def update_dashboard():
                     logger.exception(
                         "Discord dashboard edit failed."
                     )
-
-                # Recreate without sending another role ping.
 
                 if dashboard_message is None:
 
@@ -884,7 +845,7 @@ async def start_browser():
 
         user_data_dir=str(PROFILE_DIR),
 
-        headless=False,
+        headless=HEADLESS,
 
         args=[
             "--no-sandbox",
@@ -941,17 +902,15 @@ async def start_browser():
 
     try:
 
-        title = await page.title()
-
         logger.info(
             "DonutLuck page title: %s",
-            title
+            await page.title()
         )
 
-    except PlaywrightError:
+    except Exception:
 
         logger.warning(
-            "Could not read the page title during startup."
+            "Could not read page title."
         )
 
     return playwright, browser_context, page
@@ -1069,8 +1028,6 @@ async def on_ready():
 
     target_channel = channel
 
-    # Prevent duplicate monitoring after reconnects.
-
     if monitor_task is None or monitor_task.done():
 
         logger.info(
@@ -1093,6 +1050,12 @@ async def main():
         raise RuntimeError(
             "DISCORD_TOKEN is missing from your .env file."
         )
+
+    logger.info(
+        "CONFIG | Rain Role ID: %s | Big Rain Role ID: %s",
+        RAIN_ROLE_ID,
+        BIG_RAIN_ROLE_ID
+    )
 
     async with bot:
 
