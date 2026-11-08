@@ -1,10 +1,10 @@
-name: Continuous 24-7 Browser Bot
+name: Continuous 24-7 Playwright Bot
 
 on:
   schedule:
-    # This automatically triggers your bot every 3 hours, day and night
+    # Triggers a fresh runner window automatically every 3 hours
     - cron: '0 */3 * * *'
-  workflow_dispatch: # This adds a manual "Run" button to your interface
+  workflow_dispatch: # Allows manual trigger button capability
 
 jobs:
   run-bot:
@@ -26,7 +26,12 @@ jobs:
       - name: Install All Python Packages
         run: |
           pip install --upgrade pip
-          pip install selenium python-dotenv discord.py
+          pip install playwright python-dotenv discord.py
+
+      - name: Install Playwright Standalone Browser Binaries
+        run: |
+          # Installs the precise Chromium testing build engine used by Playwright
+          playwright install chromium
 
       - name: Load Environment Variables and Execute Bot
         run: |
