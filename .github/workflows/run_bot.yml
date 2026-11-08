@@ -23,10 +23,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb libxss1 libnss3 libnspr4 libgbm1
 
-      - name: Install Selenium Core Packages
+      - name: Install All Python Packages
         run: |
           pip install --upgrade pip
-          pip install selenium python-dotenv
+          pip install selenium python-dotenv discord.py
 
       - name: Load Environment Variables and Execute Bot
         run: |
