@@ -52,6 +52,9 @@ BIG_RAIN_THRESHOLD = 1_500_000_000
 
 MAX_RUN_DURATION = 11100
 
+# Signals both monitoring loops to stop before Discord disconnects.
+monitor_stop_event = asyncio.Event()
+
 
 # ============================================================
 # WEBSITE SELECTORS
@@ -407,15 +410,15 @@ async def website_poll_loop(page):
 
     logger.info("Website polling started.")
 
-    while not bot.is_closed():
+    while not bot.is_closed() and not monitor_stop_event.is_set():
 
         if time.monotonic() - start_time > MAX_RUN_DURATION:
 
             logger.info(
-                "Maximum runtime reached. Restarting through host."
+                "Maximum runtime reached. Beginning graceful shutdown."
             )
 
-            await bot.close()
+            monitor_stop_event.set()
             break
 
         try:
@@ -741,7 +744,7 @@ async def update_dashboard():
 
     logger.info("Discord dashboard initialized.")
 
-    while not bot.is_closed():
+    while not bot.is_closed() and not monitor_stop_event.is_set():
 
         try:
 
@@ -792,10 +795,21 @@ async def update_dashboard():
 
                     dashboard_message = None
 
-                except discord.HTTPException:
+                except Exception:
+
+                    if (
+                        bot.is_closed()
+                        or monitor_stop_event.is_set()
+                    ):
+
+                        logger.info(
+                            "Dashboard edit skipped during shutdown."
+                        )
+
+                        break
 
                     logger.exception(
-                        "Discord dashboard edit failed."
+                        "Discord dashboard edit failed; will retry."
                     )
 
                 if dashboard_message is None:
@@ -816,11 +830,24 @@ async def update_dashboard():
 
         except Exception:
 
+            if (
+                bot.is_closed()
+                or monitor_stop_event.is_set()
+            ):
+
+                logger.info(
+                    "Discord dashboard loop stopped during shutdown."
+                )
+
+                break
+
             logger.exception(
                 "Discord dashboard update failed."
             )
 
         await asyncio.sleep(DISCORD_UPDATE_INTERVAL)
+
+    logger.info("Discord dashboard update loop stopped.")
 
 
 # ============================================================
@@ -922,11 +949,15 @@ async def start_browser():
 
 async def start_monitoring():
 
+    global monitor_stop_event
+
     playwright = None
     browser_context = None
 
     poll_task = None
     discord_task = None
+
+    monitor_stop_event.clear()
 
     try:
 
@@ -944,6 +975,15 @@ async def start_monitoring():
             poll_task,
             discord_task
         )
+
+        # Both monitoring loops have stopped before Discord disconnects.
+        if monitor_stop_event.is_set() and not bot.is_closed():
+
+            logger.info(
+                "Monitoring loops stopped. Closing Discord connection cleanly."
+            )
+
+            await bot.close()
 
     except asyncio.CancelledError:
 
@@ -966,11 +1006,31 @@ async def start_monitoring():
 
                 task.cancel()
 
+        pending_tasks = [
+            task
+            for task in (
+                poll_task,
+                discord_task
+            )
+            if task and not task.done()
+        ]
+
+        if pending_tasks:
+
+            await asyncio.gather(
+                *pending_tasks,
+                return_exceptions=True
+            )
+
         if browser_context is not None:
 
             try:
 
                 await browser_context.close()
+
+                logger.info(
+                    "Browser context closed."
+                )
 
             except Exception:
 
@@ -983,6 +1043,10 @@ async def start_monitoring():
             try:
 
                 await playwright.stop()
+
+                logger.info(
+                    "Playwright stopped."
+                )
 
             except Exception:
 
