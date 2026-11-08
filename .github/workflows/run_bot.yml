@@ -1,14 +1,31 @@
+
 name: Continuous 24-7 Playwright Bot
 
 on:
   schedule:
-    # Triggers a fresh runner window automatically every 3 hours
     - cron: '0 */3 * * *'
-  workflow_dispatch: # Allows manual trigger button capability
+  workflow_dispatch:
+
+# Prevent multiple bot instances from running simultaneously.
+concurrency:
+  group: donutluck-rain-monitor
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+      DISCORD_CHANNEL_ID: ${{ vars.DISCORD_CHANNEL_ID || '1560149229907869791' }}
+      RAIN_ROLE_ID: ${{ vars.RAIN_ROLE_ID || '0' }}
+      BIG_RAIN_ROLE_ID: ${{ vars.BIG_RAIN_ROLE_ID || '0' }}
+
     steps:
       - name: Checkout Repository Code
         uses: actions/checkout@v4
@@ -18,25 +35,22 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Linux Framebuffer Dependencies
+      - name: Install Xvfb
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libxss1 libnss3 libnspr4 libgbm1
+          sudo apt-get install -y xvfb
 
-      - name: Install All Python Packages
+      - name: Install Python Packages
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install playwright python-dotenv discord.py
 
-      - name: Install Playwright Standalone Browser Binaries
+      - name: Install Chromium and Dependencies
         run: |
-          # Installs the precise Chromium testing build engine used by Playwright
-          playwright install chromium
+          python -m playwright install --with-deps chromium
 
-      - name: Load Environment Variables and Execute Bot
+      - name: Start DonutLuck Rain Monitor
         run: |
-          # Read your existing .env file and export keys into the step memory
-          export $(grep -v '^#' .env | xargs)
-          
-          # xvfb-run opens a hidden graphic screen layer so headless=False functions perfectly
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python rain.py
+          xvfb-run -a \
+            --server-args="-screen 0 1280x1024x24" \
+            python -u rain.py
