@@ -206,7 +206,7 @@ async def discord_dashboard_updater():
             embed.add_field(name="💎 Accumulated Pool", value=f"`{latest_data['pool']}`", inline=True)
             embed.set_footer(text="System updates in real-time | Free 24/7 Hosting Pipeline")
             embed.set_timestamp()
-                        if dashboard_message is None:
+                    if dashboard_message is None:
                 async for msg in target_channel.history(limit=5):
                     if msg.author == bot.user and msg.embeds and msg.embeds.title == "🌧️ DonutLuck Live Rain Monitor Status":
                         dashboard_message = msg
