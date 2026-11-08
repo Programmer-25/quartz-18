@@ -1,4 +1,3 @@
-
 import asyncio
 import os
 import re
@@ -9,7 +8,11 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import (
+    async_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    Error as PlaywrightError
+)
 
 
 # ============================================================
@@ -31,10 +34,9 @@ BIG_RAIN_ROLE_ID = int(os.getenv("BIG_RAIN_ROLE_ID", "0"))
 
 WEBSITE_URL = "https://donutluck.com/"
 
-# Codespaces runs without a graphical desktop.
-HEADLESS = os.getenv("HEADLESS", "true").lower() in (
-    "true", "1", "yes"
-)
+# Always use visible Chromium.
+# GitHub Actions must launch this script through xvfb-run.
+HEADLESS = False
 
 # Keep browser profile outside the repository by default.
 PROFILE_DIR = Path(
@@ -55,7 +57,7 @@ MAX_RUN_DURATION = 11100  # 3 hours and 5 minutes
 
 
 # ============================================================
-# NEW WEBSITE SELECTORS
+# WEBSITE SELECTORS
 # ============================================================
 
 # Waiting timer
@@ -247,7 +249,7 @@ def pool_to_number(value):
 
 
 # ============================================================
-# NEW WEBSITE READING SYSTEM
+# WEBSITE READING SYSTEM
 # ============================================================
 
 async def read_website_snapshot(page):
@@ -395,16 +397,61 @@ async def read_website_snapshot(page):
     }
     """
 
-    return await page.evaluate(
-        script,
-        {
-            "timer": TIMER_XPATH,
-            "activeTimer": ACTIVE_TIMER_XPATH,
-            "status": RAIN_STATUS_XPATH,
-            "participants": PARTICIPANTS_XPATH,
-            "pool": POOL_XPATH
-        }
-    )
+    selectors = {
+        "timer": TIMER_XPATH,
+        "activeTimer": ACTIVE_TIMER_XPATH,
+        "status": RAIN_STATUS_XPATH,
+        "participants": PARTICIPANTS_XPATH,
+        "pool": POOL_XPATH
+    }
+
+    # A navigation can destroy the JavaScript execution context
+    # while page.evaluate() is running. Retry that snapshot.
+
+    for attempt in range(3):
+
+        try:
+
+            if page.is_closed():
+                raise PlaywrightError("DonutLuck page is closed.")
+
+            return await page.evaluate(
+                script,
+                selectors
+            )
+
+        except PlaywrightError as error:
+
+            error_text = str(error).lower()
+
+            navigation_error = (
+                "execution context was destroyed" in error_text
+                or "most likely because of a navigation" in error_text
+                or "frame was detached" in error_text
+                or "navigation" in error_text
+            )
+
+            if not navigation_error:
+                raise
+
+            if attempt < 2:
+
+                logger.warning(
+                    "DonutLuck page navigated during snapshot "
+                    "(attempt %s/3). Retrying...",
+                    attempt + 1
+                )
+
+                await asyncio.sleep(0.4)
+
+            else:
+
+                logger.warning(
+                    "Could not read snapshot because the page "
+                    "is still navigating. Will retry next poll."
+                )
+
+    return None
 
 
 # ============================================================
@@ -432,6 +479,15 @@ async def website_poll_loop(page):
         try:
 
             snapshot = await read_website_snapshot(page)
+
+            # A navigation retry may return no snapshot.
+            # Keep the last valid values instead of replacing
+            # them with Loading or Unknown.
+
+            if snapshot is None:
+
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
 
             status = snapshot.get("status", "")
 
@@ -801,7 +857,7 @@ async def update_dashboard():
 
 
 # ============================================================
-# GITHUB CODESPACES PLAYWRIGHT BROWSER
+# PLAYWRIGHT BROWSER
 # ============================================================
 
 async def start_browser():
@@ -822,7 +878,7 @@ async def start_browser():
 
         user_data_dir=str(PROFILE_DIR),
 
-        headless=HEADLESS,
+        headless=False,
 
         args=[
             "--no-sandbox",
@@ -873,8 +929,24 @@ async def start_browser():
     await asyncio.sleep(3)
 
     logger.info(
-        "DonutLuck browser is ready."
+        "DonutLuck browser is ready. URL: %s",
+        page.url
     )
+
+    try:
+
+        title = await page.title()
+
+        logger.info(
+            "DonutLuck page title: %s",
+            title
+        )
+
+    except PlaywrightError:
+
+        logger.warning(
+            "Could not read the page title during startup."
+        )
 
     return playwright, browser_context, page
 
