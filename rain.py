@@ -730,12 +730,18 @@ async def send_active_message(channel):
         logger.info(
             "Normal Rain detected: Rain role selected."
         )
-
+        logger.info(
+            "PING DEBUG | Rain Role: %s | Big Rain Role: %s | Message: %s",
+            RAIN_ROLE_ID,
+            BIG_RAIN_ROLE_ID,
+            content
+        )
     dashboard_message = await channel.send(
         content=content,
         embed=create_active_embed(),
         allowed_mentions=allowed_mentions
     )
+    
 
 
 # ============================================================
