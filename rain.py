@@ -1,8 +1,8 @@
-
 import asyncio
 import os
 import re
 import logging
+import time
 from pathlib import Path
 
 import discord
@@ -18,14 +18,12 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-DISCORD_CHANNEL_ID = int(
-    os.getenv("DISCORD_CHANNEL_ID", "1560149229907869791")
-)
+DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "1560149229907869791"))
 
 RAIN_ROLE_ID = int(os.getenv("RAIN_ROLE_ID", "0"))
 BIG_RAIN_ROLE_ID = int(os.getenv("BIG_RAIN_ROLE_ID", "0"))
 
-WEBSITE_URL = "https://donutluck.com/"
+WEBSITE_URL = "https://donutluck.com"
 PROFILE_DIR = Path(__file__).resolve().parent / "donutluck_profile"
 
 POLL_INTERVAL = 0.25
@@ -320,356 +318,143 @@ async def read_website_snapshot(page):
     )
 
 
+# ============================================================
+# MAIN AUTOMATED LIVE POLL LOOP
+# ============================================================
+
 async def website_poll_loop(page):
+    start_time = time.time()
+    
+    # 3 hours and 5 minutes in seconds (11100) to allow clean handovers
+    MAX_RUN_DURATION = 11100 
+    
+    was_rain_active = False
+
     while not bot.is_closed():
+        # Check if the runtime deadline has arrived to allow the next scheduled workflow instance to replace this one
+        if time.time() - start_time > MAX_RUN_DURATION:
+            logger.info("3 hours completed. Gracefully shutting down to hand over to the next runner.")
+            await bot.close()
+            break
+
         try:
             snapshot = await read_website_snapshot(page)
+            
+            is_rain_active = snapshot.get("status", "").lower().find("it's about to rain!") != -1
+            
+            latest_data["timer"] = format_timer(snapshot.get("timer", ""))
+            latest_data["participants"] = snapshot.get("participants", "0") or "0"
+            latest_data["pool"] = format_pool(snapshot.get("pool", ""))
+            latest_data["rain_active"] = is_rain_active
 
-            # Select the active timer only when the rain status is present.
-            status = snapshot.get("status", "")
-            rain_active = (
-                RAIN_START_TEXT.casefold() in status.casefold()
-            )
+            # Detect Rain Starting Event Edge
+            if is_rain_active and not was_rain_active:
+                logger.info(f"Rain detected! Pool: {latest_data['pool']}")
+                bot.loop.create_task(trigger_rain_alert(latest_data["pool"]))
 
-            latest_data["rain_active"] = rain_active
-
-            if snapshot.get("timer"):
-                latest_data["timer"] = format_timer(snapshot["timer"])
-
-            if snapshot.get("participants"):
-                match = re.search(
-                    r"\d[\d,]*",
-                    snapshot["participants"],
-                )
-
-                if match:
-                    latest_data["participants"] = (
-                        match.group(0).replace(",", "")
-                    )
-
-            if snapshot.get("pool"):
-                latest_data["pool"] = format_pool(snapshot["pool"])
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception:
-            logger.exception("Website polling failed")
-
-        await asyncio.sleep(POLL_INTERVAL)
+            was_rain_active = is_rain_active
+            await asyncio.sleep(POLL_INTERVAL)
+            
+        except Exception as e:
+            logger.error(f"Polling loop runtime anomaly: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
 
 
 # ============================================================
-# EMBEDS
+# ALERT TRIGGERS & BOT CONNECTIONS
 # ============================================================
 
-def create_waiting_embed():
-    embed = discord.Embed(
-        title="🌧️ DonutLuck Rain Monitor",
-        description="```ansi\n\u001b[1;33m⏳ WAITING FOR RAIN\u001b[0m\n```",
-        color=discord.Color.gold(),
-    )
-
-    embed.add_field(
-        name="⏱️ Rain Timer",
-        value=f"```{latest_data['timer']}```",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="🌧️ Rain Pool",
-        value=f"```{latest_data['pool']}```",
-        inline=True,
-    )
-
-    embed.set_footer(text="Live status • Updates automatically")
-    return embed
-
-
-def create_active_embed():
-    embed = discord.Embed(
-        title="🌧️ DonutLuck Rain Monitor",
-        description="```ansi\n\u001b[1;31m🔴 RAIN IS ACTIVE!\u001b[0m\n```",
-        color=discord.Color.red(),
-    )
-
-    embed.add_field(
-        name="⏱️ Rain Timer",
-        value=f"```{latest_data['timer']}```",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="👥 Participants",
-        value=f"```{latest_data['participants']}```",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="🌧️ Rain Pool",
-        value=f"```{latest_data['pool']}```",
-        inline=False,
-    )
-
-    embed.set_footer(text="Live status • Updates automatically")
-    return embed
-
-
-# ============================================================
-# CHANNEL CLEANUP
-# ============================================================
-
-async def clear_previous_messages(channel):
-    logger.info("Clearing messages in #%s...", channel.name)
-
-    deleted = await channel.purge(
-        limit=None,
-        bulk=True,
-        reason="DonutLuck rain monitor refresh",
-    )
-
-    logger.info("Deleted %s messages", len(deleted))
-
-
-# ============================================================
-# ROLE-BASED ALERTS
-# ============================================================
-
-async def send_active_message(channel):
-    global dashboard_message
-
-    pool_value = pool_to_number(latest_data["pool"])
-
-    if pool_value is None:
-        # If the pool cannot be read, avoid pinging the wrong role.
-        mention = "⚠️ **Rain is active, but the pool is unavailable.**"
-        allowed_mentions = discord.AllowedMentions.none()
-
-        logger.warning(
-            "Pool value unavailable; no role was pinged."
-        )
-
-    elif pool_value >= BIG_RAIN_THRESHOLD:
-        if BIG_RAIN_ROLE_ID:
-            mention = f"<@&{BIG_RAIN_ROLE_ID}>"
-            allowed_mentions = discord.AllowedMentions(
-                roles=[discord.Object(id=BIG_RAIN_ROLE_ID)]
-            )
-        else:
-            mention = "**Big Rain**"
-            allowed_mentions = discord.AllowedMentions.none()
-            logger.warning("BIG_RAIN_ROLE_ID is not configured.")
-
-    else:
-        if RAIN_ROLE_ID:
-            mention = f"<@&{RAIN_ROLE_ID}>"
-            allowed_mentions = discord.AllowedMentions(
-                roles=[discord.Object(id=RAIN_ROLE_ID)]
-            )
-        else:
-            mention = "**Rain**"
-            allowed_mentions = discord.AllowedMentions.none()
-            logger.warning("RAIN_ROLE_ID is not configured.")
-
-    dashboard_message = await channel.send(
-        content=f"{mention} 🌧️ **RAIN IS STARTING NOW!**",
-        embed=create_active_embed(),
-        allowed_mentions=allowed_mentions,
-    )
-
-
-async def send_waiting_message(channel):
-    global dashboard_message
-
-    dashboard_message = await channel.send(
-        embed=create_waiting_embed()
-    )
-
-
-# ============================================================
-# DISCORD UPDATE LOOP
-# ============================================================
-
-async def update_dashboard():
-    global dashboard_message
-
-    channel = target_channel
-    was_active = False
-
-    await clear_previous_messages(channel)
-    await send_waiting_message(channel)
-
-    while not bot.is_closed():
-        try:
-            is_active = latest_data["rain_active"]
-
-            if is_active and not was_active:
-                await clear_previous_messages(channel)
-                await send_active_message(channel)
-                was_active = True
-
-            elif not is_active and was_active:
-                await clear_previous_messages(channel)
-                await send_waiting_message(channel)
-                was_active = False
-
-            elif dashboard_message is not None:
-                embed = (
-                    create_active_embed()
-                    if was_active
-                    else create_waiting_embed()
-                )
-
-                try:
-                    await dashboard_message.edit(embed=embed)
-
-                except discord.NotFound:
-                    dashboard_message = None
-
-                except discord.HTTPException:
-                    logger.exception("Discord dashboard edit failed")
-
-                if dashboard_message is None:
-                    if was_active:
-                        # Recreate the dashboard without another role ping.
-                        dashboard_message = await channel.send(
-                            embed=create_active_embed()
-                        )
-                    else:
-                        await send_waiting_message(channel)
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception:
-            logger.exception("Discord dashboard update failed")
-
-        await asyncio.sleep(DISCORD_UPDATE_INTERVAL)
-
-
-# ============================================================
-# BROWSER
-# ============================================================
-
-async def start_browser():
-    global browser_context, website_page
-
-    playwright = await async_playwright().start()
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-    browser_context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR),
-        headless=False,
-        args=[
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows",
-        ],
-        viewport={"width": 1280, "height": 900},
-    )
-
-    website_page = (
-        browser_context.pages[0]
-        if browser_context.pages
-        else await browser_context.new_page()
-    )
-
-    website_page.set_default_timeout(3000)
-
-    logger.info("Opening DonutLuck...")
-
-    try:
-        await website_page.goto(
-            WEBSITE_URL,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-    except PlaywrightTimeoutError:
-        logger.warning("Page load timed out; continuing.")
-
-    await asyncio.sleep(2)
-    logger.info("Browser ready")
-
-    return playwright
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-async def start_monitoring():
-    playwright = None
-    poll_task = None
-    discord_task = None
-
-    try:
-        playwright = await start_browser()
-
-        poll_task = asyncio.create_task(
-            website_poll_loop(website_page)
-        )
-
-        discord_task = asyncio.create_task(
-            update_dashboard()
-        )
-
-        await asyncio.gather(poll_task, discord_task)
-
-    except asyncio.CancelledError:
-        raise
-
-    except Exception:
-        logger.exception("Monitor stopped unexpectedly")
-
-    finally:
-        for task in (poll_task, discord_task):
-            if task and not task.done():
-                task.cancel()
-
-        if playwright is not None:
-            try:
-                await playwright.stop()
-            except Exception:
-                logger.exception("Could not stop Playwright cleanly")
-
+async def trigger_rain_alert(pool_str):
+    if not target_channel:
+        return
+
+pool_numeric = pool_to_number(pool_str) or 0
+# Determine the role level notification tags
+role_ping = ""
+if pool_numeric >= BIG_RAIN_THRESHOLD and BIG_RAIN_ROLE_ID:
+role_ping = f"<@&{BIG_RAIN_ROLE_ID}>"
+elif RAIN_ROLE_ID:
+role_ping = f"<@&{RAIN_ROLE_ID}>"
+embed = discord.Embed(
+title="🌧️ DonutLuck Rain Event Started!",
+description=f"A fresh rain event is active right now on DonutLuck!",
+color=discord.Color.blue(),
+)
+embed.add_field(name="💰 Pool Amount", value=f"{pool_str}", inline=True)
+embed.add_field(name="🔗 Website Link", value=f"Open DonutLuck", inline=True)
+embed.set_timestamp()
+try:
+await target_channel.send(content=role_ping, embed=embed)
+except Exception as e:
+logger.error(f"Failed to dispatch Discord alert embed: {e}")
+async def discord_dashboard_updater():
+await bot.wait_until_ready()
+global target_channel, dashboard_message
+target_channel = bot.get_channel(DISCORD_CHANNEL_ID)
+if not target_channel:
+logger.error(f"Target channel ID {DISCORD_CHANNEL_ID} could not be resolved.")
+return
+logger.info("Discord live status layout operational.")
+while not bot.is_closed():
+try:
+embed = discord.Embed(
+title="🌧️ DonutLuck Live Rain Monitor Status",
+color=discord.Color.gold() if latest_data["rain_active"] else discord.Color.dark_gray(),
+)
+status_text = "🟢 ACTIVE RAIN SCENE" if latest_data["rain_active"] else "⚪ Waiting for next rain"
+embed.add_field(name="Current State", value=f"{status_text}", inline=False)
+embed.add_field(name="⏱️ Timer Remaining", value=f"{latest_data['timer']}", inline=True)
+embed.add_field(name="👥 Group Entrants", value=f"{latest_data['participants']}", inline=True)
+embed.add_field(name="💎 Accumulated Pool", value=f"{latest_data['pool']}", inline=True)
+embed.set_footer(text="System updates in real-time | Free 24/7 Hosting Pipeline")
+embed.set_timestamp()
+if dashboard_message is None:
+# Look back in history to maintain stability across workflow instance drops
+async for msg in target_channel.history(limit=5):
+if msg.author == bot.user and msg.embeds and msg.embeds[0].title == "🌧️ DonutLuck Live Rain Monitor Status":
+dashboard_message = msg
+break
+if dashboard_message is None:
+dashboard_message = await target_channel.send(embed=embed)
+else:
+await dashboard_message.edit(embed=embed)
+else:
+await dashboard_message.edit(embed=embed)
+except Exception as e:
+logger.error(f"Failed updating target dashboard profile status frame: {e}")
+await asyncio.sleep(DISCORD_UPDATE_INTERVAL)
+
+============================================================
+
+
+BOT LIFECYCLE MANAGEMENT
+
+
+============================================================
 
 @bot.event
 async def on_ready():
-    global target_channel, monitor_task
-
-    logger.info("Logged in as %s", bot.user)
-
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
-        except discord.HTTPException:
-            logger.exception("Could not find the configured channel.")
-            return
-
-    target_channel = channel
-
-    if monitor_task is None or monitor_task.done():
-        monitor_task = asyncio.create_task(start_monitoring())
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-async def main():
-    if not DISCORD_TOKEN:
-        raise RuntimeError(
-            "DISCORD_TOKEN is missing from your .env file."
-        )
-
-    async with bot:
-        await bot.start(DISCORD_TOKEN)
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Rain monitor stopped.")
+logger.info(f"Bot authenticated cleanly as user profile: {bot.user}")
+global monitor_task
+# Initialize the virtual headless browser workspace engine
+playwright_context = await async_playwright().start()
+# Configure Chromium behind Xvfb simulation canvas mappings
+browser = await playwright_context.chromium.launch(
+headless=False,
+args=["--no-sandbox", "--disable-dev-shm-usage"]
+)
+# Emulate context storage space bounds
+context = await browser.new_context(viewport={"width": 1280, "height": 1024})
+page = await context.new_page()
+logger.info(f"Connecting browser instance framework to target: {WEBSITE_URL}")
+await page.goto(WEBSITE_URL, wait_until="networkidle")
+# Fire background processing modules concurrently
+bot.loop.create_task(discord_dashboard_updater())
+monitor_task = bot.loop.create_task(website_poll_loop(page))
+def main():
+if not DISCORD_TOKEN:
+logger.error("Missing DISCORD_TOKEN inside environment configuration profile targets.")
+return
+bot.run(DISCORD_TOKEN)
+if name == "main":
+main()
