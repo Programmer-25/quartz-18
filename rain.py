@@ -201,17 +201,22 @@ async def discord_dashboard_updater():
             embed = discord.Embed(title="🌧️ DonutLuck Live Rain Monitor Status", color=discord.Color.gold() if latest_data["rain_active"] else discord.Color.dark_gray())
             status_text = "🟢 ACTIVE RAIN SCENE" if latest_data["rain_active"] else "⚪ Waiting for next rain"
             embed.add_field(name="Current State", value=f"**{status_text}**", inline=False)
-            embed.add_field(name="⏱️ Timer Remaining", value=f"`{latest_data['timer']}``", inline=True)
-            embed.add_field(name="👥 Group Entrants", value=f"`{latest_data['participants']}``", inline=True)
-            embed.add_field(name="💎 Accumulated Pool", value=f"`{latest_data['pool']}``", inline=True)
+            embed.add_field(name="⏱️ Timer Remaining", value=f"`{latest_data['timer']}`", inline=True)
+            embed.add_field(name="👥 Group Entrants", value=f"`{latest_data['participants']}`", inline=True)
+            embed.add_field(name="💎 Accumulated Pool", value=f"`{latest_data['pool']}`", inline=True)
             embed.set_footer(text="System updates in real-time | Free 24/7 Hosting Pipeline")
             embed.set_timestamp()
             if dashboard_message is None:
                 async for msg in target_channel.history(limit=5):
-                    if msg.author == bot.user and msg.embeds and msg.embeds[0].title == "🌧️ DonutLuck Live Rain Monitor Status":
+                    if msg.author == bot.user and msg.embeds and msg.embeds.title == "🌧️ DonutLuck Live Rain Monitor Status":
                         dashboard_message = msg
                         break
                 if dashboard_message is None:
+            if dashboard_message is None:
+                async for msg in target_channel.history(limit=5):
+                    if msg.author == bot.user and msg.embeds and msg.embeds.title == "🌧️ DonutLuck Live Rain Monitor Status":
+                        dashboard_message = msg
+                        break
                 if dashboard_message is None:
                     dashboard_message = await target_channel.send(embed=embed)
                 else:
