@@ -458,7 +458,7 @@ async def trigger_rain_alert(pool_str):
         inline=True
     )
 
-    embed.set_timestamp()
+    embed.timestamp = discord.utils.utcnow()
 
     try:
 
@@ -561,7 +561,7 @@ async def discord_dashboard_updater():
                 )
             )
 
-            embed.set_timestamp()
+            embed.timestamp = discord.utils.utcnow()
 
             # Find the existing dashboard message.
 
