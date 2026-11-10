@@ -1,6 +1,6 @@
 
 name: Continuous 24-7 Playwright Bot
-
+ 
 on:
   schedule:
     - cron: '0 */3 * * *'
