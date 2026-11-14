@@ -20,7 +20,7 @@ jobs:
       DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
       RAIN_ROLE_ID: ${{ secrets.RAIN_ROLE_ID }}
       BIG_RAIN_ROLE_ID: ${{ secrets.BIG_RAIN_ROLE_ID }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
