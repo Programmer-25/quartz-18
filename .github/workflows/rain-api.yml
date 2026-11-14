@@ -1,0 +1,40 @@
+
+name: DonutLuck API Rain Monitor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  rain-monitor:
+    name: API Rain Monitor
+    runs-on: ubuntu-latest
+    timeout-minutes: 59
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+      DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+      RAIN_ROLE_ID: ${{ secrets.RAIN_ROLE_ID }}
+      BIG_RAIN_ROLE_ID: ${{ secrets.BIG_RAIN_ROLE_ID }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install discord.py aiohttp python-dotenv
+
+      - name: Start API Rain Bot
+        run: python -u rain_api.py
