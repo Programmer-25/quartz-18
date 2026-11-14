@@ -21,7 +21,9 @@ load_dotenv(BASE_DIR / ".env")
 API_URL = "https://donutluck.com/api/chat/rain/state"
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "1560149229907869791"))
+DISCORD_CHANNEL_ID = int(
+    os.getenv("DISCORD_CHANNEL_ID", "1560149229907869791")
+)
 
 RAIN_ROLE_ID = os.getenv("RAIN_ROLE_ID", "").strip()
 BIG_RAIN_ROLE_ID = os.getenv("BIG_RAIN_ROLE_ID", "").strip()
@@ -37,10 +39,7 @@ DISCORD_UPDATE_INTERVAL = 1.0
 
 BIG_RAIN_THRESHOLD = 1_500_000_000
 
-# Trigger the next GitHub Actions run after 27 minutes 30 seconds.
 NEXT_RUN_AFTER = 27 * 60 + 30
-
-# Give the replacement time to connect and take over.
 HANDOFF_WAIT_SECONDS = 150
 
 API_TIMEOUT = 10
@@ -70,7 +69,6 @@ bot = commands.Bot(
 )
 
 monitor_task = None
-
 shutdown_requested = asyncio.Event()
 
 RUN_ID = os.getenv("GITHUB_RUN_ID", "local")
@@ -231,6 +229,7 @@ def create_active_embed():
 async def clear_previous_messages(channel):
 
     try:
+
         await channel.purge(
             limit=None,
             bulk=True
@@ -239,6 +238,7 @@ async def clear_previous_messages(channel):
         logger.info("Channel cleanup completed.")
 
     except Exception:
+
         logger.exception("Could not clear channel.")
 
 
@@ -344,12 +344,23 @@ async def prepare_handoff(channel):
         return False
 
     start = time.monotonic()
+    last_refresh = 0
 
     while time.monotonic() - start < HANDOFF_WAIT_SECONDS:
 
         try:
 
-            await channel.fetch()
+            # Refresh the channel from Discord.
+            # TextChannel.fetch() does not exist.
+            now = time.monotonic()
+
+            if now - last_refresh >= 3:
+
+                channel = await bot.fetch_channel(
+                    DISCORD_CHANNEL_ID
+                )
+
+                last_refresh = now
 
             if channel.topic == acknowledge_marker(RUN_ID):
 
@@ -422,10 +433,12 @@ async def check_for_handoff(channel):
 async def dispatch_next_run():
 
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+
         logger.error(
             "GitHub token or repository is missing. "
             "Cannot start replacement."
         )
+
         return False
 
     url = (
@@ -512,7 +525,7 @@ async def monitor_loop():
         timeout=timeout
     ) as session:
 
-        # Require a valid API response before taking over.
+        # Require valid API data before taking over.
         while not shutdown_requested.is_set():
 
             try:
@@ -534,7 +547,7 @@ async def monitor_loop():
         if shutdown_requested.is_set():
             return
 
-        # New instances request handoff before taking control.
+        # New instance requests handoff before taking control.
         await prepare_handoff(channel)
 
         if shutdown_requested.is_set():
@@ -573,19 +586,17 @@ async def monitor_loop():
         start_time = time.monotonic()
         next_run_dispatched = False
         last_dashboard_update = 0
-        consecutive_errors = 0
 
         logger.info("Rain monitoring started.")
 
         while not shutdown_requested.is_set():
 
-            # Check whether a replacement instance is requesting handoff.
             if await check_for_handoff(channel):
                 break
 
             elapsed = time.monotonic() - start_time
 
-            # Start the replacement at 27:30.
+            # Start replacement after 27 minutes 30 seconds.
             if elapsed >= NEXT_RUN_AFTER and not next_run_dispatched:
 
                 success = await dispatch_next_run()
@@ -599,26 +610,19 @@ async def monitor_loop():
 
                 latest_data.update(new_data)
 
-                consecutive_errors = 0
-
             except asyncio.CancelledError:
                 raise
 
             except Exception:
 
-                consecutive_errors += 1
-
-                logger.exception(
-                    "API request failed. Consecutive errors: %s",
-                    consecutive_errors
-                )
+                logger.exception("API request failed.")
 
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
             rain_active = latest_data["rain_active"]
 
-            # Rain has just started.
+            # Rain started.
             if rain_active and not was_active:
 
                 logger.info("RAIN STARTED.")
@@ -629,7 +633,7 @@ async def monitor_loop():
 
                 was_active = True
 
-            # Rain has ended.
+            # Rain ended.
             elif not rain_active and was_active:
 
                 logger.info("RAIN ENDED.")
