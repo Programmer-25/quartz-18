@@ -178,27 +178,38 @@ async def fetch_rain_state(session):
 
 
 # ============================================================
-# EMBEDS
+# EMBEDS - ORIGINAL DESIGN
 # ============================================================
 
 def create_waiting_embed():
 
     embed = discord.Embed(
-        title="⏳ WAITING FOR RAIN",
+        title="🌧️ DonutLuck Rain Monitor",
+        description=(
+            "```ansi\n"
+            "\u001b[1;33m⏳ WAITING FOR RAIN\u001b[0m\n"
+            "```"
+        ),
         color=discord.Color.gold()
     )
 
     embed.add_field(
-        name="Rain Timer",
-        value=format_timer(latest_data["timer"]),
+        name="⏱️ Rain Timer",
+        value=f"```{format_timer(latest_data['timer'])}```",
         inline=True
     )
 
     embed.add_field(
-        name="Rain Pool",
-        value=format_pool(latest_data["pool"]),
+        name="🌧️ Rain Pool",
+        value=f"```{format_pool(latest_data['pool'])}```",
         inline=True
     )
+
+    embed.set_footer(
+        text="Live status • Updates automatically"
+    )
+
+    embed.timestamp = discord.utils.utcnow()
 
     return embed
 
@@ -206,27 +217,38 @@ def create_waiting_embed():
 def create_active_embed():
 
     embed = discord.Embed(
-        title="🔴 RAIN IS ACTIVE!",
+        title="🌧️ DonutLuck Rain Monitor",
+        description=(
+            "```ansi\n"
+            "\u001b[1;31m🔴 RAIN IS ACTIVE!\u001b[0m\n"
+            "```"
+        ),
         color=discord.Color.red()
     )
 
     embed.add_field(
-        name="Rain Timer",
-        value=format_timer(latest_data["timer"]),
+        name="⏱️ Rain Timer",
+        value=f"```{format_timer(latest_data['timer'])}```",
         inline=True
     )
 
     embed.add_field(
-        name="Participants",
-        value=str(latest_data["participants"]),
+        name="👥 Participants",
+        value=f"```{latest_data['participants']}```",
         inline=True
     )
 
     embed.add_field(
-        name="Rain Pool",
-        value=format_pool(latest_data["pool"]),
-        inline=True
+        name="🌧️ Rain Pool",
+        value=f"```{format_pool(latest_data['pool'])}```",
+        inline=False
     )
+
+    embed.set_footer(
+        text="Live status • Updates automatically"
+    )
+
+    embed.timestamp = discord.utils.utcnow()
 
     return embed
 
@@ -264,6 +286,7 @@ async def find_dashboard_message(channel):
         title = message.embeds[0].title or ""
 
         if title in (
+            "🌧️ DonutLuck Rain Monitor",
             "⏳ WAITING FOR RAIN",
             "🔴 RAIN IS ACTIVE!"
         ):
@@ -637,8 +660,6 @@ async def check_for_handoff(channel, session):
 
         for request_message, requested_run in request_messages:
 
-            # A message alone is not enough.
-            # Verify the requesting GitHub Actions run is active.
             active = await is_workflow_run_active(
                 session,
                 requested_run
@@ -664,7 +685,7 @@ async def check_for_handoff(channel, session):
                 requested_run
             )
 
-            ack_message = await channel.send(
+            await channel.send(
                 embed=create_handoff_embed(
                     HANDOFF_ACK_TITLE,
                     requested_run
