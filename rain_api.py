@@ -40,12 +40,17 @@ DISCORD_UPDATE_INTERVAL = 1.0
 BIG_RAIN_THRESHOLD = 1_500_000_000
 
 NEXT_RUN_AFTER = 27 * 60 + 30
-HANDOFF_WAIT_SECONDS = 45
 
-API_TIMEOUT = 10
+HANDOFF_WAIT_SECONDS = 45
 HANDOFF_CHECK_INTERVAL = 3
 
+API_TIMEOUT = 10
+STARTUP_CHECK_RETRIES = 12
+
 RUN_ID = os.getenv("GITHUB_RUN_ID", "local")
+
+HANDOFF_REQUEST_TITLE = "RAIN-HANDOFF-REQUEST"
+HANDOFF_ACK_TITLE = "RAIN-HANDOFF-ACK"
 
 
 # ============================================================
@@ -316,22 +321,35 @@ async def send_active_message(channel):
 
 
 # ============================================================
-# CHECK FOR ANOTHER ACTIVE GITHUB RUN
+# GITHUB WORKFLOW HELPERS
 # ============================================================
+
+def github_headers():
+
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
 
 async def has_previous_active_run():
 
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        logger.info(
-            "GitHub credentials unavailable. "
-            "Skipping startup handoff check."
+
+        logger.error(
+            "GitHub credentials are missing. "
+            "Cannot safely check for another running bot."
         )
-        return False
+
+        return None
 
     if RUN_ID == "local":
+
         logger.info(
-            "Local run detected. Skipping startup handoff."
+            "Local run detected. Skipping startup handoff check."
         )
+
         return False
 
     url = (
@@ -339,12 +357,6 @@ async def has_previous_active_run():
         f"{GITHUB_REPOSITORY}/actions/workflows/"
         f"{WORKFLOW_FILE}/runs"
     )
-
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
 
     params = {
         "status": "in_progress",
@@ -361,7 +373,7 @@ async def has_previous_active_run():
 
             async with session.get(
                 url,
-                headers=headers,
+                headers=github_headers(),
                 params=params
             ) as response:
 
@@ -376,7 +388,7 @@ async def has_previous_active_run():
                         body[:300]
                     )
 
-                    return False
+                    return None
 
                 data = await response.json()
 
@@ -409,96 +421,184 @@ async def has_previous_active_run():
             "Could not check previous GitHub workflow runs."
         )
 
+        return None
+
+
+async def is_workflow_run_active(session, run_id):
+
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
         return False
 
-
-# ============================================================
-# HANDOFF SYSTEM
-# ============================================================
-
-def request_marker(run_id):
-    return f"RAIN-HANDOFF-REQUEST:{run_id}"
-
-
-def acknowledge_marker(run_id):
-    return f"RAIN-HANDOFF-ACK:{run_id}"
-
-
-async def prepare_handoff(channel):
-
-    original_topic = channel.topic or ""
-
-    marker = request_marker(RUN_ID)
-
-    logger.info(
-        "Requesting handoff. Run ID: %s",
-        RUN_ID
+    url = (
+        f"https://api.github.com/repos/"
+        f"{GITHUB_REPOSITORY}/actions/runs/{run_id}"
     )
 
     try:
 
-        await channel.edit(topic=marker)
+        async with session.get(
+            url,
+            headers=github_headers()
+        ) as response:
+
+            if response.status == 404:
+                return False
+
+            if response.status != 200:
+
+                body = await response.text()
+
+                logger.warning(
+                    "Could not verify handoff run %s: "
+                    "HTTP %s | %s",
+                    run_id,
+                    response.status,
+                    body[:200]
+                )
+
+                return False
+
+            data = await response.json()
+
+        if data.get("status") != "in_progress":
+            return False
+
+        expected_path = f".github/workflows/{WORKFLOW_FILE}"
+        actual_path = data.get("path", "")
+
+        if actual_path != expected_path:
+            logger.warning(
+                "Handoff request %s belongs to another workflow.",
+                run_id
+            )
+            return False
+
+        return True
 
     except Exception:
 
         logger.exception(
-            "Could not write handoff request to channel topic."
+            "Could not verify GitHub run %s.",
+            run_id
+        )
+
+        return False
+
+
+# ============================================================
+# MESSAGE-BASED HANDOFF
+# ============================================================
+
+def create_handoff_embed(title, run_id):
+
+    return discord.Embed(
+        title=title,
+        description=str(run_id),
+        color=discord.Color.dark_grey()
+    )
+
+
+async def find_handoff_message(channel, title, run_id):
+
+    async for message in channel.history(limit=50):
+
+        if message.author != bot.user:
+            continue
+
+        if not message.embeds:
+            continue
+
+        embed = message.embeds[0]
+
+        if (
+            embed.title == title
+            and embed.description == str(run_id)
+        ):
+            return message
+
+    return None
+
+
+async def prepare_handoff(channel):
+
+    logger.info(
+        "Requesting handoff using Discord messages. Run ID: %s",
+        RUN_ID
+    )
+
+    request_message = None
+
+    try:
+
+        request_message = await channel.send(
+            embed=create_handoff_embed(
+                HANDOFF_REQUEST_TITLE,
+                RUN_ID
+            )
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Could not send handoff request message."
         )
 
         return False
 
     start = time.monotonic()
-    last_refresh = 0
 
     while time.monotonic() - start < HANDOFF_WAIT_SECONDS:
 
         try:
 
-            now = time.monotonic()
+            ack_message = await find_handoff_message(
+                channel,
+                HANDOFF_ACK_TITLE,
+                RUN_ID
+            )
 
-            if now - last_refresh >= HANDOFF_CHECK_INTERVAL:
-
-                channel = await bot.fetch_channel(
-                    DISCORD_CHANNEL_ID
-                )
-
-                last_refresh = now
-
-            if channel.topic == acknowledge_marker(RUN_ID):
+            if ack_message is not None:
 
                 logger.info(
                     "Previous bot acknowledged handoff."
                 )
 
                 try:
-                    await channel.edit(topic=original_topic)
-                except Exception:
-                    logger.exception(
-                        "Could not restore original channel topic."
-                    )
+                    await request_message.delete()
+                except discord.NotFound:
+                    pass
+
+                try:
+                    await ack_message.delete()
+                except discord.NotFound:
+                    pass
 
                 return True
 
         except Exception:
 
-            logger.exception("Handoff check failed.")
+            logger.exception(
+                "Could not check handoff acknowledgement."
+            )
 
         await asyncio.sleep(1)
 
-    logger.warning(
+    logger.error(
         "Handoff acknowledgement timed out. "
-        "Starting monitoring anyway."
+        "Replacement will not take control."
     )
 
     try:
-        await channel.edit(topic=original_topic)
+        await request_message.delete()
     except Exception:
-        logger.exception("Could not restore channel topic.")
+        logger.warning(
+            "Could not delete timed-out handoff request."
+        )
 
     return False
 
 
-async def check_for_handoff(channel):
+async def check_for_handoff(channel, session):
 
     global last_handoff_check
 
@@ -511,45 +611,79 @@ async def check_for_handoff(channel):
 
     try:
 
-        # Always refresh the channel.
-        # The cached channel topic may be outdated.
-        fresh_channel = await bot.fetch_channel(
-            DISCORD_CHANNEL_ID
-        )
+        request_messages = []
 
-        topic = fresh_channel.topic or ""
+        async for message in channel.history(limit=50):
 
-        if not topic.startswith("RAIN-HANDOFF-REQUEST:"):
-            return False
+            if message.author != bot.user:
+                continue
 
-        requested_run = topic.split(":", 1)[1]
+            if not message.embeds:
+                continue
 
-        if requested_run == RUN_ID:
-            return False
+            embed = message.embeds[0]
 
-        logger.info(
-            "Replacement bot is ready. "
-            "Acknowledging run %s.",
-            requested_run
-        )
+            if embed.title != HANDOFF_REQUEST_TITLE:
+                continue
 
-        await fresh_channel.edit(
-            topic=acknowledge_marker(requested_run)
-        )
+            requested_run = (embed.description or "").strip()
 
-        shutdown_requested.set()
+            if not requested_run or requested_run == RUN_ID:
+                continue
 
-        logger.info(
-            "Handoff acknowledged. Shutting down old bot."
-        )
+            request_messages.append(
+                (message, requested_run)
+            )
 
-        return True
+        for request_message, requested_run in request_messages:
+
+            # A message alone is not enough.
+            # Verify the requesting GitHub Actions run is active.
+            active = await is_workflow_run_active(
+                session,
+                requested_run
+            )
+
+            if not active:
+
+                logger.info(
+                    "Ignoring stale or inactive handoff request: %s",
+                    requested_run
+                )
+
+                try:
+                    await request_message.delete()
+                except Exception:
+                    pass
+
+                continue
+
+            logger.info(
+                "Verified replacement run %s is active. "
+                "Acknowledging handoff.",
+                requested_run
+            )
+
+            ack_message = await channel.send(
+                embed=create_handoff_embed(
+                    HANDOFF_ACK_TITLE,
+                    requested_run
+                )
+            )
+
+            logger.info(
+                "Handoff acknowledged. Shutting down old bot."
+            )
+
+            shutdown_requested.set()
+
+            return True
 
     except Exception:
 
-        logger.exception("Handoff acknowledgement failed.")
+        logger.exception("Handoff check failed.")
 
-        return False
+    return False
 
 
 # ============================================================
@@ -573,12 +707,6 @@ async def dispatch_next_run():
         f"{WORKFLOW_FILE}/dispatches"
     )
 
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
-
     payload = {
         "ref": GITHUB_REF_NAME
     }
@@ -593,7 +721,7 @@ async def dispatch_next_run():
 
             async with session.post(
                 url,
-                headers=headers,
+                headers=github_headers(),
                 json=payload
             ) as response:
 
@@ -676,12 +804,54 @@ async def monitor_loop():
         if shutdown_requested.is_set():
             return
 
-        # Only request a handoff if another workflow is actually active.
-        previous_run_active = await has_previous_active_run()
+        # Wait for a reliable GitHub startup check.
+        previous_run_active = None
 
+        if RUN_ID != "local":
+
+            for attempt in range(STARTUP_CHECK_RETRIES):
+
+                previous_run_active = await has_previous_active_run()
+
+                if previous_run_active is not None:
+                    break
+
+                logger.warning(
+                    "GitHub startup check failed. Retry %s/%s.",
+                    attempt + 1,
+                    STARTUP_CHECK_RETRIES
+                )
+
+                await asyncio.sleep(5)
+
+            if previous_run_active is None:
+
+                logger.error(
+                    "Could not determine whether an old bot is running. "
+                    "Exiting to avoid duplicate dashboard controllers."
+                )
+
+                await bot.close()
+                return
+
+        else:
+
+            previous_run_active = False
+
+        # Only request handoff when an older run is confirmed active.
         if previous_run_active:
 
-            await prepare_handoff(channel)
+            handoff_success = await prepare_handoff(channel)
+
+            if not handoff_success:
+
+                logger.error(
+                    "Handoff failed. Keeping the existing bot in control. "
+                    "This replacement will exit."
+                )
+
+                await bot.close()
+                return
 
         else:
 
@@ -721,7 +891,10 @@ async def monitor_loop():
 
             except discord.NotFound:
 
-                dashboard_message = await send_waiting_message(channel)
+                if was_active:
+                    dashboard_message = await send_active_message(channel)
+                else:
+                    dashboard_message = await send_waiting_message(channel)
 
         start_time = time.monotonic()
         next_run_dispatched = False
@@ -731,7 +904,7 @@ async def monitor_loop():
 
         while not shutdown_requested.is_set():
 
-            if await check_for_handoff(channel):
+            if await check_for_handoff(channel, session):
                 break
 
             elapsed = time.monotonic() - start_time
@@ -819,7 +992,7 @@ async def monitor_loop():
 
     logger.info("Monitoring stopped.")
 
-    # Actually disconnect the old bot after a successful handoff.
+    # Disconnect the old bot after successful handoff.
     if shutdown_requested.is_set():
 
         logger.info("Closing old Discord bot connection.")
