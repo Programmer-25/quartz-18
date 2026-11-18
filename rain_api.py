@@ -31,23 +31,23 @@ BIG_RAIN_ROLE_ID = os.getenv("BIG_RAIN_ROLE_ID", "").strip()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "").strip()
 GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "main").strip()
+GITHUB_RUN_ID = os.getenv("GITHUB_RUN_ID", "local").strip()
 
 WORKFLOW_FILE = "rain-api.yml"
 
-POLL_INTERVAL = 1.0
-DISCORD_UPDATE_INTERVAL = 1.0
+POLL_INTERVAL = 1
+DISCORD_UPDATE_INTERVAL = 1
 
 BIG_RAIN_THRESHOLD = 1_500_000_000
 
 NEXT_RUN_AFTER = 27 * 60 + 30
+DISPATCH_RETRY_INTERVAL = 120
 
 HANDOFF_WAIT_SECONDS = 45
-HANDOFF_CHECK_INTERVAL = 3
+HANDOFF_CHECK_INTERVAL = 2
 
 API_TIMEOUT = 10
-STARTUP_CHECK_RETRIES = 12
-
-RUN_ID = os.getenv("GITHUB_RUN_ID", "local")
+GITHUB_TIMEOUT = 15
 
 HANDOFF_REQUEST_TITLE = "RAIN-HANDOFF-REQUEST"
 HANDOFF_ACK_TITLE = "RAIN-HANDOFF-ACK"
@@ -79,11 +79,9 @@ bot = commands.Bot(
 monitor_task = None
 shutdown_requested = asyncio.Event()
 
-last_handoff_check = 0
-
 
 # ============================================================
-# CURRENT RAIN DATA
+# STATE
 # ============================================================
 
 latest_data = {
@@ -93,25 +91,24 @@ latest_data = {
     "rain_active": False
 }
 
+last_handoff_check = 0
+
 
 # ============================================================
 # FORMATTING
 # ============================================================
 
 def format_timer(seconds):
-
     try:
         seconds = max(0, int(seconds))
     except (ValueError, TypeError):
         seconds = 0
 
     minutes, seconds = divmod(seconds, 60)
-
     return f"{minutes:02d}:{seconds:02d}"
 
 
 def format_pool(value):
-
     try:
         value = float(value)
     except (ValueError, TypeError):
@@ -133,20 +130,23 @@ def format_pool(value):
 # API
 # ============================================================
 
-HEADERS = {
+API_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
-    "Referer": "https://donutluck.com/",
+    "Referer": "https://donutluck.com/"
 }
 
 
 async def fetch_rain_state(session):
-
-    async with session.get(API_URL) as response:
+    async with session.get(
+        API_URL,
+        headers=API_HEADERS,
+        timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)
+    ) as response:
 
         if response.status != 200:
             body = await response.text()
@@ -178,11 +178,10 @@ async def fetch_rain_state(session):
 
 
 # ============================================================
-# EMBEDS - ORIGINAL DESIGN
+# EMBEDS
 # ============================================================
 
 def create_waiting_embed():
-
     embed = discord.Embed(
         title="🌧️ DonutLuck Rain Monitor",
         description=(
@@ -209,13 +208,10 @@ def create_waiting_embed():
         text="Live status • Updates automatically"
     )
 
-    embed.timestamp = discord.utils.utcnow()
-
     return embed
 
 
 def create_active_embed():
-
     embed = discord.Embed(
         title="🌧️ DonutLuck Rain Monitor",
         description=(
@@ -248,8 +244,6 @@ def create_active_embed():
         text="Live status • Updates automatically"
     )
 
-    embed.timestamp = discord.utils.utcnow()
-
     return embed
 
 
@@ -258,23 +252,15 @@ def create_active_embed():
 # ============================================================
 
 async def clear_previous_messages(channel):
-
     try:
-
-        await channel.purge(
-            limit=None,
-            bulk=True
-        )
-
+        await channel.purge(limit=None, bulk=True)
         logger.info("Channel cleanup completed.")
 
     except Exception:
-
         logger.exception("Could not clear channel.")
 
 
 async def find_dashboard_message(channel):
-
     async for message in channel.history(limit=50):
 
         if message.author != bot.user:
@@ -283,72 +269,78 @@ async def find_dashboard_message(channel):
         if not message.embeds:
             continue
 
-        title = message.embeds[0].title or ""
-
-        if title in (
-            "🌧️ DonutLuck Rain Monitor",
-            "⏳ WAITING FOR RAIN",
-            "🔴 RAIN IS ACTIVE!"
-        ):
+        if message.embeds[0].title == "🌧️ DonutLuck Rain Monitor":
             return message
 
     return None
 
 
 async def send_waiting_message(channel):
-
     message = await channel.send(
         embed=create_waiting_embed()
     )
 
     logger.info("Waiting dashboard sent.")
-
     return message
 
 
-async def send_active_message(channel):
+async def send_active_message(channel, announce=False):
+    role_ids = []
 
-    pool = latest_data["pool"]
+    if announce:
+        pool = latest_data["pool"]
 
-    mentions = []
+        if pool >= BIG_RAIN_THRESHOLD:
 
-    if pool >= BIG_RAIN_THRESHOLD:
+            if RAIN_ROLE_ID:
+                role_ids.append(RAIN_ROLE_ID)
 
-        if RAIN_ROLE_ID:
-            mentions.append(f"<@&{RAIN_ROLE_ID}>")
+            if BIG_RAIN_ROLE_ID:
+                role_ids.append(BIG_RAIN_ROLE_ID)
 
-        if BIG_RAIN_ROLE_ID:
-            mentions.append(f"<@&{BIG_RAIN_ROLE_ID}>")
+            logger.info("BIG RAIN detected.")
 
-        logger.info("BIG RAIN detected.")
+        elif pool > 0 and RAIN_ROLE_ID:
+            role_ids.append(RAIN_ROLE_ID)
 
-    elif pool > 0:
+    valid_role_ids = []
 
-        if RAIN_ROLE_ID:
-            mentions.append(f"<@&{RAIN_ROLE_ID}>")
+    for role_id in role_ids:
+        try:
+            valid_role_ids.append(int(role_id))
 
-    content = " ".join(mentions) if mentions else None
+        except (ValueError, TypeError):
+            logger.warning("Invalid role ID: %s", role_id)
+
+    content = " ".join(
+        f"<@&{role_id}>"
+        for role_id in valid_role_ids
+    )
+
+    allowed_mentions = discord.AllowedMentions(
+        roles=[
+            discord.Object(id=role_id)
+            for role_id in valid_role_ids
+        ],
+        everyone=False,
+        users=False
+    )
 
     message = await channel.send(
-        content=content,
+        content=content or None,
         embed=create_active_embed(),
-        allowed_mentions=discord.AllowedMentions(
-            roles=True,
-            everyone=False
-        )
+        allowed_mentions=allowed_mentions
     )
 
     logger.info("Active rain dashboard sent.")
-
     return message
 
 
 # ============================================================
-# GITHUB WORKFLOW HELPERS
+# GITHUB API
 # ============================================================
 
 def github_headers():
-
     return {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
@@ -356,173 +348,169 @@ def github_headers():
     }
 
 
-async def has_previous_active_run():
-
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-
-        logger.error(
-            "GitHub credentials are missing. "
-            "Cannot safely check for another running bot."
-        )
-
-        return None
-
-    if RUN_ID == "local":
-
-        logger.info(
-            "Local run detected. Skipping startup handoff check."
-        )
-
-        return False
-
-    url = (
-        f"https://api.github.com/repos/"
-        f"{GITHUB_REPOSITORY}/actions/workflows/"
-        f"{WORKFLOW_FILE}/runs"
+def github_workflow_runs_url():
+    return (
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
+        f"/actions/workflows/{WORKFLOW_FILE}/runs"
     )
 
-    params = {
-        "status": "in_progress",
-        "per_page": 20
-    }
 
-    timeout = aiohttp.ClientTimeout(total=15)
-
-    try:
-
-        async with aiohttp.ClientSession(
-            timeout=timeout
-        ) as session:
-
-            async with session.get(
-                url,
-                headers=github_headers(),
-                params=params
-            ) as response:
-
-                if response.status != 200:
-
-                    body = await response.text()
-
-                    logger.warning(
-                        "Could not check active GitHub runs: "
-                        "HTTP %s | %s",
-                        response.status,
-                        body[:300]
-                    )
-
-                    return None
-
-                data = await response.json()
-
-        runs = data.get("workflow_runs", [])
-
-        for run in runs:
-
-            other_run_id = str(run.get("id", ""))
-
-            if (
-                other_run_id
-                and other_run_id != RUN_ID
-                and run.get("status") == "in_progress"
-            ):
-
-                logger.info(
-                    "Found previous active workflow run: %s",
-                    other_run_id
-                )
-
-                return True
-
-        logger.info("No previous active workflow run found.")
-
-        return False
-
-    except Exception:
-
-        logger.exception(
-            "Could not check previous GitHub workflow runs."
-        )
-
+async def get_workflow_runs(session):
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
         return None
 
-
-async def is_workflow_run_active(session, run_id):
-
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        return False
-
-    url = (
-        f"https://api.github.com/repos/"
-        f"{GITHUB_REPOSITORY}/actions/runs/{run_id}"
-    )
-
     try:
-
         async with session.get(
-            url,
-            headers=github_headers()
+            github_workflow_runs_url(),
+            headers=github_headers(),
+            params={"per_page": 100},
+            timeout=aiohttp.ClientTimeout(total=GITHUB_TIMEOUT)
         ) as response:
 
-            if response.status == 404:
-                return False
-
             if response.status != 200:
-
                 body = await response.text()
 
                 logger.warning(
-                    "Could not verify handoff run %s: "
-                    "HTTP %s | %s",
-                    run_id,
+                    "GitHub runs request failed: HTTP %s %s",
                     response.status,
                     body[:200]
                 )
 
+                return None
+
+            data = await response.json()
+
+        runs = data.get("workflow_runs", [])
+
+        return [
+            run for run in runs
+            if run.get("path") == f".github/workflows/{WORKFLOW_FILE}"
+        ]
+
+    except Exception:
+        logger.exception("Could not retrieve GitHub workflow runs.")
+        return None
+
+
+def active_run(run):
+    return (
+        run.get("status") in (
+            "queued",
+            "in_progress",
+            "waiting",
+            "requested",
+            "pending"
+        )
+    )
+
+
+async def find_newer_run(session):
+    runs = await get_workflow_runs(session)
+
+    if runs is None:
+        return None
+
+    try:
+        current_id = int(GITHUB_RUN_ID)
+
+    except ValueError:
+        return None
+
+    newer = []
+
+    for run in runs:
+        try:
+            run_id = int(run.get("id", 0))
+
+        except (ValueError, TypeError):
+            continue
+
+        if run_id > current_id and active_run(run):
+            newer.append(run)
+
+    if not newer:
+        return None
+
+    return max(
+        newer,
+        key=lambda run: int(run.get("id", 0))
+    )
+
+
+async def has_previous_active_run(session):
+    runs = await get_workflow_runs(session)
+
+    if runs is None:
+        return None
+
+    try:
+        current_id = int(GITHUB_RUN_ID)
+
+    except ValueError:
+        return False
+
+    for run in runs:
+        try:
+            run_id = int(run.get("id", 0))
+
+        except (ValueError, TypeError):
+            continue
+
+        if run_id != current_id and active_run(run):
+            return True
+
+    return False
+
+
+async def is_workflow_run_active(session, run_id):
+    url = (
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
+        f"/actions/runs/{run_id}"
+    )
+
+    try:
+        async with session.get(
+            url,
+            headers=github_headers(),
+            timeout=aiohttp.ClientTimeout(total=GITHUB_TIMEOUT)
+        ) as response:
+
+            if response.status != 200:
                 return False
 
             data = await response.json()
 
-        if data.get("status") != "in_progress":
-            return False
-
-        expected_path = f".github/workflows/{WORKFLOW_FILE}"
-        actual_path = data.get("path", "")
-
-        if actual_path != expected_path:
-            logger.warning(
-                "Handoff request %s belongs to another workflow.",
-                run_id
+        return (
+            data.get("status") in (
+                "queued",
+                "in_progress",
+                "waiting",
+                "requested",
+                "pending"
             )
-            return False
-
-        return True
-
-    except Exception:
-
-        logger.exception(
-            "Could not verify GitHub run %s.",
-            run_id
+            and data.get("path") == f".github/workflows/{WORKFLOW_FILE}"
         )
 
+    except Exception:
+        logger.exception("Could not verify workflow run.")
         return False
 
 
 # ============================================================
-# MESSAGE-BASED HANDOFF
+# HANDOFF MESSAGES
 # ============================================================
 
 def create_handoff_embed(title, run_id):
-
-    return discord.Embed(
+    embed = discord.Embed(
         title=title,
         description=str(run_id),
         color=discord.Color.dark_grey()
     )
 
+    return embed
+
 
 async def find_handoff_message(channel, title, run_id):
-
     async for message in channel.history(limit=50):
 
         if message.author != bot.user:
@@ -543,99 +531,70 @@ async def find_handoff_message(channel, title, run_id):
 
 
 async def prepare_handoff(channel):
-
-    logger.info(
-        "Requesting handoff using Discord messages. Run ID: %s",
-        RUN_ID
-    )
-
-    request_message = None
+    if GITHUB_RUN_ID == "local":
+        return True
 
     try:
-
-        request_message = await channel.send(
+        request = await channel.send(
             embed=create_handoff_embed(
                 HANDOFF_REQUEST_TITLE,
-                RUN_ID
+                GITHUB_RUN_ID
             )
         )
 
-    except Exception:
-
-        logger.exception(
-            "Could not send handoff request message."
+        logger.info(
+            "Handoff request sent for run %s.",
+            GITHUB_RUN_ID
         )
 
-        return False
+        start = time.monotonic()
 
-    start = time.monotonic()
+        while time.monotonic() - start < HANDOFF_WAIT_SECONDS:
 
-    while time.monotonic() - start < HANDOFF_WAIT_SECONDS:
-
-        try:
-
-            ack_message = await find_handoff_message(
+            ack = await find_handoff_message(
                 channel,
                 HANDOFF_ACK_TITLE,
-                RUN_ID
+                GITHUB_RUN_ID
             )
 
-            if ack_message is not None:
-
-                logger.info(
-                    "Previous bot acknowledged handoff."
-                )
-
+            if ack:
                 try:
-                    await request_message.delete()
+                    await request.delete()
+                    await ack.delete()
+
                 except discord.NotFound:
                     pass
 
-                try:
-                    await ack_message.delete()
-                except discord.NotFound:
-                    pass
-
+                logger.info("Handoff acknowledged.")
                 return True
 
-        except Exception:
+            await asyncio.sleep(1)
 
-            logger.exception(
-                "Could not check handoff acknowledgement."
-            )
+        try:
+            await request.delete()
 
-        await asyncio.sleep(1)
+        except discord.NotFound:
+            pass
 
-    logger.error(
-        "Handoff acknowledgement timed out. "
-        "Replacement will not take control."
-    )
+        logger.warning("Handoff acknowledgement timed out.")
+        return False
 
-    try:
-        await request_message.delete()
     except Exception:
-        logger.warning(
-            "Could not delete timed-out handoff request."
-        )
-
-    return False
+        logger.exception("Handoff preparation failed.")
+        return False
 
 
 async def check_for_handoff(channel, session):
-
     global last_handoff_check
 
     now = time.monotonic()
 
     if now - last_handoff_check < HANDOFF_CHECK_INTERVAL:
-        return False
+        return
 
     last_handoff_check = now
 
     try:
-
-        request_messages = []
-
         async for message in channel.history(limit=50):
 
             if message.author != bot.user:
@@ -649,375 +608,448 @@ async def check_for_handoff(channel, session):
             if embed.title != HANDOFF_REQUEST_TITLE:
                 continue
 
-            requested_run = (embed.description or "").strip()
+            try:
+                requested_run_id = int(embed.description)
 
-            if not requested_run or requested_run == RUN_ID:
+            except (ValueError, TypeError):
                 continue
 
-            request_messages.append(
-                (message, requested_run)
-            )
+            try:
+                current_run_id = int(GITHUB_RUN_ID)
 
-        for request_message, requested_run in request_messages:
+            except ValueError:
+                continue
 
-            active = await is_workflow_run_active(
+            if requested_run_id <= current_run_id:
+                continue
+
+            is_active = await is_workflow_run_active(
                 session,
-                requested_run
+                requested_run_id
             )
 
-            if not active:
-
-                logger.info(
-                    "Ignoring stale or inactive handoff request: %s",
-                    requested_run
-                )
-
-                try:
-                    await request_message.delete()
-                except Exception:
-                    pass
-
+            if not is_active:
                 continue
 
-            logger.info(
-                "Verified replacement run %s is active. "
-                "Acknowledging handoff.",
-                requested_run
+            existing_ack = await find_handoff_message(
+                channel,
+                HANDOFF_ACK_TITLE,
+                str(requested_run_id)
             )
+
+            if existing_ack:
+                shutdown_requested.set()
+                return
 
             await channel.send(
                 embed=create_handoff_embed(
                     HANDOFF_ACK_TITLE,
-                    requested_run
+                    requested_run_id
                 )
             )
 
             logger.info(
-                "Handoff acknowledged. Shutting down old bot."
+                "Acknowledged handoff to run %s.",
+                requested_run_id
             )
 
             shutdown_requested.set()
-
-            return True
+            return
 
     except Exception:
-
         logger.exception("Handoff check failed.")
 
-    return False
-
 
 # ============================================================
-# GITHUB WORKFLOW DISPATCH
+# DISPATCH NEXT WORKFLOW
 # ============================================================
 
-async def dispatch_next_run():
-
+async def dispatch_next_run(session):
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-
-        logger.error(
-            "GitHub token or repository is missing. "
-            "Cannot start replacement."
-        )
-
+        logger.error("Missing GitHub token or repository.")
         return False
 
     url = (
-        f"https://api.github.com/repos/"
-        f"{GITHUB_REPOSITORY}/actions/workflows/"
-        f"{WORKFLOW_FILE}/dispatches"
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
+        f"/actions/workflows/{WORKFLOW_FILE}/dispatches"
     )
 
     payload = {
         "ref": GITHUB_REF_NAME
     }
 
-    timeout = aiohttp.ClientTimeout(total=20)
-
     try:
+        async with session.post(
+            url,
+            headers=github_headers(),
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=GITHUB_TIMEOUT)
+        ) as response:
 
-        async with aiohttp.ClientSession(
-            timeout=timeout
-        ) as session:
+            if response.status == 204:
+                logger.info("Next workflow dispatch accepted.")
+                return True
 
-            async with session.post(
-                url,
-                headers=github_headers(),
-                json=payload
-            ) as response:
+            body = await response.text()
 
-                if response.status == 204:
+            logger.error(
+                "Workflow dispatch failed: HTTP %s %s",
+                response.status,
+                body[:300]
+            )
 
-                    logger.info(
-                        "Next GitHub Actions run successfully triggered."
-                    )
-
-                    return True
-
-                body = await response.text()
-
-                logger.error(
-                    "GitHub dispatch failed: HTTP %s | %s",
-                    response.status,
-                    body[:500]
-                )
-
-                return False
+            return False
 
     except Exception:
-
-        logger.exception("Could not dispatch next workflow.")
-
+        logger.exception("Workflow dispatch request failed.")
         return False
 
 
 # ============================================================
-# MONITOR
+# STARTUP COORDINATION
+# ============================================================
+
+async def coordinate_startup(channel, session):
+    if GITHUB_RUN_ID == "local":
+        logger.info("Local run: GitHub coordination skipped.")
+        return True
+
+    for attempt in range(12):
+
+        newer_run = await find_newer_run(session)
+
+        if newer_run:
+            logger.warning(
+                "A newer workflow run already exists: %s. Exiting.",
+                newer_run.get("id")
+            )
+            return False
+
+        previous = await has_previous_active_run(session)
+
+        if previous is None:
+            logger.warning(
+                "Could not verify existing workflow runs. "
+                "Retrying startup check."
+            )
+
+            await asyncio.sleep(5)
+            continue
+
+        if not previous:
+            logger.info("No previous active workflow run.")
+            return True
+
+        logger.info(
+            "Previous workflow run detected. Requesting handoff."
+        )
+
+        success = await prepare_handoff(channel)
+
+        if success:
+            return True
+
+        # If another run has appeared, this run must not take over.
+        newer_run = await find_newer_run(session)
+
+        if newer_run:
+            logger.warning(
+                "Another newer run appeared during handoff. Exiting."
+            )
+            return False
+
+        logger.warning(
+            "Handoff was not acknowledged. Retrying startup."
+        )
+
+        await asyncio.sleep(5)
+
+    logger.error(
+        "Could not safely coordinate startup. Exiting."
+    )
+
+    return False
+
+
+# ============================================================
+# MONITOR LOOP
 # ============================================================
 
 async def monitor_loop():
+    global latest_data
+
+    started_at = time.monotonic()
+    last_dispatch_attempt = 0
+    replacement_seen = False
 
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
 
     if channel is None:
-
-        channel = await bot.fetch_channel(
-            DISCORD_CHANNEL_ID
-        )
+        channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
 
     if not isinstance(channel, discord.TextChannel):
-
         logger.error("Configured channel is not a text channel.")
-
+        await bot.close()
         return
 
-    logger.info(
-        "Connected to Discord channel: %s",
-        channel.name
+    timeout = aiohttp.ClientTimeout(
+        total=API_TIMEOUT
     )
 
-    timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
 
-    async with aiohttp.ClientSession(
-        headers=HEADERS,
-        timeout=timeout
-    ) as session:
+        # ----------------------------------------------------
+        # Initial API connection
+        # ----------------------------------------------------
 
-        # Require valid API data before taking control.
-        while not shutdown_requested.is_set():
+        initial_data = None
+
+        for attempt in range(12):
 
             try:
-
-                latest_data.update(
-                    await fetch_rain_state(session)
-                )
-
+                initial_data = await fetch_rain_state(session)
                 break
 
             except Exception:
-
                 logger.exception(
-                    "Initial API request failed. Retrying."
-                )
-
-                await asyncio.sleep(3)
-
-        if shutdown_requested.is_set():
-            return
-
-        # Wait for a reliable GitHub startup check.
-        previous_run_active = None
-
-        if RUN_ID != "local":
-
-            for attempt in range(STARTUP_CHECK_RETRIES):
-
-                previous_run_active = await has_previous_active_run()
-
-                if previous_run_active is not None:
-                    break
-
-                logger.warning(
-                    "GitHub startup check failed. Retry %s/%s.",
-                    attempt + 1,
-                    STARTUP_CHECK_RETRIES
+                    "Initial API check failed (%s/12).",
+                    attempt + 1
                 )
 
                 await asyncio.sleep(5)
 
-            if previous_run_active is None:
-
-                logger.error(
-                    "Could not determine whether an old bot is running. "
-                    "Exiting to avoid duplicate dashboard controllers."
-                )
-
-                await bot.close()
-                return
-
-        else:
-
-            previous_run_active = False
-
-        # Only request handoff when an older run is confirmed active.
-        if previous_run_active:
-
-            handoff_success = await prepare_handoff(channel)
-
-            if not handoff_success:
-
-                logger.error(
-                    "Handoff failed. Keeping the existing bot in control. "
-                    "This replacement will exit."
-                )
-
-                await bot.close()
-                return
-
-        else:
-
-            logger.info(
-                "No old bot is running. "
-                "Starting without a handoff."
-            )
-
-        if shutdown_requested.is_set():
+        if initial_data is None:
+            logger.error("Initial API connection failed.")
+            await bot.close()
             return
 
-        dashboard_message = await find_dashboard_message(channel)
+        latest_data = initial_data
 
-        was_active = latest_data["rain_active"]
+        logger.info(
+            "Initial API state: Timer=%s | Pool=%s | Active=%s",
+            format_timer(latest_data["timer"]),
+            format_pool(latest_data["pool"]),
+            latest_data["rain_active"]
+        )
 
-        if dashboard_message is None:
+        # ----------------------------------------------------
+        # Startup coordination
+        # ----------------------------------------------------
 
+        can_start = await coordinate_startup(
+            channel,
+            session
+        )
+
+        if not can_start:
+            logger.warning("This workflow run is not taking over.")
+            await bot.close()
+            return
+
+        # ----------------------------------------------------
+        # Dashboard initialization
+        # ----------------------------------------------------
+
+        dashboard = await find_dashboard_message(channel)
+
+        if dashboard is None:
+            logger.info("No existing dashboard found.")
             await clear_previous_messages(channel)
 
-            if was_active:
-                dashboard_message = await send_active_message(channel)
+            if latest_data["rain_active"]:
+                dashboard = await send_active_message(
+                    channel,
+                    announce=False
+                )
             else:
-                dashboard_message = await send_waiting_message(channel)
+                dashboard = await send_waiting_message(channel)
 
         else:
+            if latest_data["rain_active"]:
+                await dashboard.edit(
+                    embed=create_active_embed()
+                )
+            else:
+                await dashboard.edit(
+                    embed=create_waiting_embed()
+                )
 
-            try:
+            logger.info("Existing dashboard reused.")
 
-                if was_active:
-                    await dashboard_message.edit(
-                        embed=create_active_embed()
-                    )
-                else:
-                    await dashboard_message.edit(
-                        embed=create_waiting_embed()
-                    )
+        previous_active = latest_data["rain_active"]
 
-            except discord.NotFound:
-
-                if was_active:
-                    dashboard_message = await send_active_message(channel)
-                else:
-                    dashboard_message = await send_waiting_message(channel)
-
-        start_time = time.monotonic()
-        next_run_dispatched = False
-        last_dashboard_update = 0
-
-        logger.info("Rain monitoring started.")
+        # ----------------------------------------------------
+        # Main monitoring loop
+        # ----------------------------------------------------
 
         while not shutdown_requested.is_set():
 
-            if await check_for_handoff(channel, session):
+            await check_for_handoff(
+                channel,
+                session
+            )
+
+            if shutdown_requested.is_set():
                 break
 
-            elapsed = time.monotonic() - start_time
+            elapsed = time.monotonic() - started_at
 
-            # Start replacement after 27 minutes 30 seconds.
-            if elapsed >= NEXT_RUN_AFTER and not next_run_dispatched:
+            # ------------------------------------------------
+            # Replacement workflow management
+            # ------------------------------------------------
 
-                success = await dispatch_next_run()
+            if elapsed >= NEXT_RUN_AFTER:
 
-                if success:
-                    next_run_dispatched = True
+                newer_run = await find_newer_run(session)
+
+                if newer_run:
+                    replacement_seen = True
+
+                    logger.info(
+                        "Replacement workflow detected: %s (%s).",
+                        newer_run.get("id"),
+                        newer_run.get("status")
+                    )
+
+                    if newer_run.get("status") in (
+                        "completed",
+                        "cancelled"
+                    ):
+                        replacement_seen = False
+
+                if (
+                    not replacement_seen
+                    and time.monotonic() - last_dispatch_attempt
+                    >= DISPATCH_RETRY_INTERVAL
+                ):
+
+                    last_dispatch_attempt = time.monotonic()
+
+                    dispatched = await dispatch_next_run(
+                        session
+                    )
+
+                    if dispatched:
+                        logger.info(
+                            "Waiting for replacement workflow to appear."
+                        )
+
+            # ------------------------------------------------
+            # Fetch rain state
+            # ------------------------------------------------
 
             try:
-
                 new_data = await fetch_rain_state(session)
-
-                latest_data.update(new_data)
 
             except asyncio.CancelledError:
                 raise
 
             except Exception:
-
-                logger.exception("API request failed.")
-
+                logger.exception("Rain API request failed.")
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            rain_active = latest_data["rain_active"]
+            latest_data = new_data
 
-            # Rain started.
-            if rain_active and not was_active:
+            current_active = latest_data["rain_active"]
 
-                logger.info("RAIN STARTED.")
+            logger.info(
+                "Timer=%s | Pool=%s | Participants=%s | Active=%s",
+                format_timer(latest_data["timer"]),
+                format_pool(latest_data["pool"]),
+                latest_data["participants"],
+                current_active
+            )
+
+            # ------------------------------------------------
+            # Rain state transition
+            # ------------------------------------------------
+
+            if current_active != previous_active:
+
+                logger.info(
+                    "Rain state changed: %s -> %s",
+                    previous_active,
+                    current_active
+                )
 
                 await clear_previous_messages(channel)
 
-                dashboard_message = await send_active_message(channel)
+                if current_active:
+                    dashboard = await send_active_message(
+                        channel,
+                        announce=True
+                    )
 
-                was_active = True
+                else:
+                    dashboard = await send_waiting_message(
+                        channel
+                    )
 
-            # Rain ended.
-            elif not rain_active and was_active:
+                previous_active = current_active
 
-                logger.info("RAIN ENDED.")
+            # ------------------------------------------------
+            # Update existing dashboard
+            # ------------------------------------------------
 
-                await clear_previous_messages(channel)
-
-                dashboard_message = await send_waiting_message(channel)
-
-                was_active = False
-
-            # Update dashboard.
-            now = time.monotonic()
-
-            if now - last_dashboard_update >= DISCORD_UPDATE_INTERVAL:
+            else:
 
                 try:
+                    if dashboard is None:
+                        dashboard = await find_dashboard_message(
+                            channel
+                        )
 
-                    if rain_active:
-                        embed = create_active_embed()
+                    if dashboard is None:
+                        if current_active:
+                            dashboard = await send_active_message(
+                                channel,
+                                announce=False
+                            )
+                        else:
+                            dashboard = await send_waiting_message(
+                                channel
+                            )
+
                     else:
-                        embed = create_waiting_embed()
+                        embed = (
+                            create_active_embed()
+                            if current_active
+                            else create_waiting_embed()
+                        )
 
-                    await dashboard_message.edit(
-                        embed=embed
-                    )
+                        await dashboard.edit(embed=embed)
 
                 except discord.NotFound:
-
-                    if rain_active:
-                        dashboard_message = await send_active_message(channel)
-                    else:
-                        dashboard_message = await send_waiting_message(channel)
-
-                except discord.HTTPException:
-
-                    logger.exception(
-                        "Discord dashboard update failed."
+                    logger.warning(
+                        "Dashboard message disappeared. Recreating."
                     )
 
-                last_dashboard_update = now
+                    if current_active:
+                        dashboard = await send_active_message(
+                            channel,
+                            announce=False
+                        )
+                    else:
+                        dashboard = await send_waiting_message(
+                            channel
+                        )
 
-            await asyncio.sleep(POLL_INTERVAL)
+                except discord.HTTPException:
+                    logger.exception(
+                        "Could not update Discord dashboard."
+                    )
 
-    logger.info("Monitoring stopped.")
+                except Exception:
+                    logger.exception(
+                        "Unexpected dashboard update error."
+                    )
 
-    # Disconnect the old bot after successful handoff.
-    if shutdown_requested.is_set():
+            await asyncio.sleep(DISCORD_UPDATE_INTERVAL)
 
-        logger.info("Closing old Discord bot connection.")
+    logger.info("Monitor loop ended.")
 
+    if not bot.is_closed():
         await bot.close()
 
 
@@ -1027,18 +1059,28 @@ async def monitor_loop():
 
 @bot.event
 async def on_ready():
-
     global monitor_task
 
-    logger.info("Logged in as %s", bot.user)
+    logger.info(
+        "Logged in as %s (%s)",
+        bot.user,
+        bot.user.id
+    )
 
     if monitor_task is None or monitor_task.done():
-
         monitor_task = asyncio.create_task(
             monitor_loop()
         )
 
-        logger.info("Monitoring task started.")
+
+@bot.event
+async def on_disconnect():
+    logger.warning("Discord connection lost.")
+
+
+@bot.event
+async def on_resumed():
+    logger.info("Discord connection resumed.")
 
 
 # ============================================================
@@ -1046,29 +1088,26 @@ async def on_ready():
 # ============================================================
 
 async def main():
-
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is missing.")
 
-    logger.info("Starting DonutLuck API Rain Bot.")
-    logger.info("Run ID: %s", RUN_ID)
+    if not DISCORD_CHANNEL_ID:
+        raise RuntimeError("DISCORD_CHANNEL_ID is missing.")
 
     try:
-
         await bot.start(DISCORD_TOKEN)
 
     finally:
-
         if not bot.is_closed():
             await bot.close()
 
 
 if __name__ == "__main__":
-
     try:
-
         asyncio.run(main())
 
     except KeyboardInterrupt:
-
         logger.info("Bot stopped manually.")
+
+    except Exception:
+        logger.exception("Fatal bot error.")
